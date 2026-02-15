@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Ecto Migrations",
+			"type": "shell",
+			"command": "mix ecto.migrate"
+		}
+	]
+}

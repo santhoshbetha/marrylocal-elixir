@@ -637,8 +637,4 @@ defmodule Marrylocal.Accounts.Accounts do
 
     {:ok, %{upload_url: url, public_url: "https://your-bucket.s3.amazonaws.com/#{s3_path}"}}
   end
-
-
-
-
 end

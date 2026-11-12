@@ -15,9 +15,10 @@ defmodule Marrylocal.Admin do
       email: target_user.email,
       aadhar_number: target_user.aadhar_number,
       # Store the full struct as a map, plus who banned them
-      data: Map.from_struct(target_user)
-            |> Map.delete(:__meta__)
-            |> Map.put(:banned_by_admin_id, admin.id),
+      data:
+        Map.from_struct(target_user)
+        |> Map.delete(:__meta__)
+        |> Map.put(:banned_by_admin_id, admin.id),
       reason: reason
     })
 
@@ -28,7 +29,6 @@ defmodule Marrylocal.Admin do
 
     # 4. Clear sensitive arrays in the main table
     |> Multi.update(:clear_data, User.changeset(target_user, %{images: [], shortlist: []}))
-
     |> Repo.transaction()
   end
 

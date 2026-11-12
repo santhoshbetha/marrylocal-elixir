@@ -5,10 +5,10 @@ defmodule MarrylocalWeb.Plugs.RequireAdmin do
   def init(opts), do: opts
 
   def call(conn, _opts) do
-    # current_user is already assigned by your existing fetch_api_user plug
+    # `current_user` is already assigned by `:fetch_current_user`.
     user = conn.assigns[:current_user]
 
-    if user && user.role == :admin do
+    if admin?(user) do
       conn
     else
       conn
@@ -17,4 +17,7 @@ defmodule MarrylocalWeb.Plugs.RequireAdmin do
       |> halt()
     end
   end
+
+  defp admin?(%{role: role}), do: role in [:admin, "admin"]
+  defp admin?(_user), do: false
 end

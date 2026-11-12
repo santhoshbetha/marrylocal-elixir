@@ -20,32 +20,29 @@ defmodule MarrylocalWeb.SearchJSON do
   end
 
   def data(user) do
-    # Helper to check if still within 15 mins
-    is_online =
-      case user.time_of_login do
-        nil -> false
-        time -> DateTime.diff(DateTime.utc_now(), time, :minute) <= 15
-      end
     %{
       id: user.id,
       shortid: user.shortid,
       first_name: user.first_name,
       age: user.age,
-      is_online: is_online, # Green dot indicator
+      # Green dot indicator from the live Phoenix Presence registry.
+      is_online: MarrylocalWeb.Presence.online?(user.id),
       religion: user.religion,
       community: user.community,
       economic_status: user.economic_status,
       job_status: user.job_status,
       city: user.city,
       images: user.images,
-      is_mutual: Map.get(user, :is_mutual, false), # Support virtual field
-      # New field added
-      last_login_at: user.time_of_login,
+      # Support virtual field
+      is_mutual: Map.get(user, :is_mutual, false),
+      # Persisted authentication metrics
+      last_login_at: user.last_login_at || user.time_of_login,
+      last_seen_at: user.last_seen_at,
       # You could also add distance if you select it in the query
       is_active: user.user_state == :active
     }
   end
 end
 
-#Pro-Tip: If you find that updating the database on every single API request is too slow, you can use Redis to track "Online" status and only sync
-#it to PostgreSQL every few minutes.
+# Pro-Tip: If you find that updating the database on every single API request is too slow, you can use Redis to track "Online" status and only sync
+# it to PostgreSQL every few minutes.

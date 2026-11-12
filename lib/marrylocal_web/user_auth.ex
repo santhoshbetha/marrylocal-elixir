@@ -4,8 +4,70 @@ defmodule MarrylocalWeb.UserAuth do
   import Plug.Conn
   import Phoenix.Controller
 
+  require Logger
+
   alias Marrylocal.Accounts
   alias Marrylocal.Accounts.Scope
+
+  ## API bearer authentication
+  #
+  # The bearer value is an opaque database-backed token. It is verified against
+  # a SHA-256 digest on every request, so any node behind the load balancer can
+  # serve any request without shared process state.
+
+  @doc """
+  Reads the `Authorization: Bearer ...` header and assigns `:current_user`.
+
+  This plug never halts; compose it with `require_authenticated_api_user/2` on
+  routes that require a session.
+  """
+  def fetch_current_user(conn, _opts) do
+    with ["Bearer " <> token] <- get_req_header(conn, "authorization"),
+         {user, _token_inserted_at} when not is_nil(user) <-
+           Accounts.get_user_by_session_token(token) do
+      Accounts.touch_last_seen(user)
+      Logger.metadata(user_id: user.id)
+      assign(conn, :current_user, user)
+    else
+      _ -> assign(conn, :current_user, nil)
+    end
+  end
+
+  @doc "Halts with a clean 401 JSON payload when no bearer user is present."
+  def require_authenticated_api_user(conn, _opts) do
+    if conn.assigns[:current_user] do
+      conn
+    else
+      conn
+      |> put_status(:unauthorized)
+      |> json(%{status: "error", message: "You must log in to access this resource."})
+      |> halt()
+    end
+  end
+
+  @doc "Blocks an already-authenticated API client from re-authenticating."
+  def redirect_if_api_authenticated(conn, _opts) do
+    if conn.assigns[:current_user] do
+      conn
+      |> put_status(:forbidden)
+      |> json(%{status: "error", message: "You are already logged in."})
+      |> halt()
+    else
+      conn
+    end
+  end
+
+  @doc "Requires a very recent login for sensitive API mutations."
+  def require_api_sudo_mode(conn, _opts) do
+    if conn.assigns[:current_user] && Accounts.sudo_mode?(conn.assigns.current_user, -10) do
+      conn
+    else
+      conn
+      |> put_status(:forbidden)
+      |> json(%{status: "error", message: "You must re-authenticate to access this resource."})
+      |> halt()
+    end
+  end
 
   # Make the remember me cookie valid for 14 days. This should match
   # the session validity setting in UserToken.

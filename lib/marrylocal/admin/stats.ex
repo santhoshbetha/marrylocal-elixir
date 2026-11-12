@@ -9,16 +9,20 @@ defmodule Marrylocal.Admin.Stats do
     total_users = Repo.aggregate(from(u in User, where: u.user_state == :active), :count, :id)
 
     # 2. Today's Joins (Created Today)
-    today_joins = Repo.aggregate(
-      from(u in User, where: fragment("?::date", u.date_of_creation) == ^today),
-      :count, :id
-    )
+    today_joins =
+      Repo.aggregate(
+        from(u in User, where: fragment("?::date", u.date_of_creation) == ^today),
+        :count,
+        :id
+      )
 
     # 3. Pending Verifications (Unverified Aadhar or Email)
-    pending_verifications = Repo.aggregate(
-      from(u in User, where: u.aadhar_verified == false or u.email_verified == false),
-      :count, :id
-    )
+    pending_verifications =
+      Repo.aggregate(
+        from(u in User, where: u.aadhar_verified == false or u.email_verified == false),
+        :count,
+        :id
+      )
 
     # 4. Archived/Deleted Users count
     archived_count = Repo.aggregate(Marrylocal.DeletedUser, :count, :id)

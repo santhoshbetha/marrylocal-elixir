@@ -1,6 +1,12 @@
 defmodule MarrylocalWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :marrylocal
 
+  # CORS must run before every other plug. If it sits inside a router pipeline
+  # only, then parser failures, storage failures, and other early 500s are sent
+  # without Access-Control-Allow-Origin, and the browser reports them as a
+  # misleading "missing CORS header" error instead of the real status.
+  plug MarrylocalWeb.Plugs.CORS
+
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
   # Set :encryption_salt if you would also like to encrypt it.
@@ -11,9 +17,11 @@ defmodule MarrylocalWeb.Endpoint do
     same_site: "Lax"
   ]
 
-  socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: @session_options]],
-    longpoll: [connect_info: [session: @session_options]]
+  # Native JSON API socket used by the React client. Authentication is the
+  # opaque bearer token passed as `params.token`, not a cookie.
+  socket "/socket", MarrylocalWeb.UserSocket,
+    websocket: true,
+    longpoll: false
 
   # Serve at "/" the static files from "priv/static" directory.
   #
@@ -33,17 +41,21 @@ defmodule MarrylocalWeb.Endpoint do
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :marrylocal
   end
 
-  plug Phoenix.LiveDashboard.RequestLogger,
-    param_key: "request_logger",
-    cookie_key: "request_logger"
-
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  # Photos are uploaded as multipart/form-data. The client caps files at 5 MB,
+  # but cropping can add overhead, so allow a 10 MB body and read it in
+  # generous chunks. `:length` applies to urlencoded and multipart bodies and
+  # prevents Plug.Parsers from raising RequestTooLargeError on high-resolution
+  # images.
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
-    json_decoder: Phoenix.json_library()
+    json_decoder: Phoenix.json_library(),
+    length: 10_000_000,
+    read_length: 1_000_000,
+    read_timeout: 30_000
 
   plug Plug.MethodOverride
   plug Plug.Head

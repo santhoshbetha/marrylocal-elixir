@@ -1,5 +1,5 @@
 defmodule Marrylocal.Workers.R2Cleanup do
-  use Oban.Worker, queue: :media
+  use Oban.Worker, queue: :default
   alias ExAws.S3
 
   @bucket "marrylocal-images"
@@ -14,7 +14,8 @@ defmodule Marrylocal.Workers.R2Cleanup do
     |> ExAws.request()
     |> case do
       {:ok, %{body: %{contents: []}}} ->
-        :ok # Folder already empty
+        # Folder already empty
+        :ok
 
       {:ok, %{body: %{contents: objects}}} ->
         # 2. Extract keys and delete them in bulk

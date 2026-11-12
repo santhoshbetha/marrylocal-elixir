@@ -1,5 +1,37 @@
 import Config
 
+# Development convenience: `mix phx.server` does not read the git-ignored
+# `.env`, so Cloudflare R2, PhonePe, and mail credentials are invisible unless
+# the shell exported them. Load the file at boot for dev only. Existing
+# environment variables always win, so a shell override or a deployment is never
+# replaced by a stray local file. Test and prod deliberately skip this.
+if config_env() == :dev do
+  env_file = Path.expand("../.env", __DIR__)
+
+  if File.exists?(env_file) do
+    env_file
+    |> File.stream!()
+    |> Enum.each(fn line ->
+      line = String.trim(line)
+
+      if line != "" and not String.starts_with?(line, "#") do
+        case String.split(line, "=", parts: 2) do
+          [key, value] ->
+            key = String.trim(key)
+            value = value |> String.trim() |> String.trim("\"") |> String.trim("'")
+
+            if key != "" and is_nil(System.get_env(key)) do
+              System.put_env(key, value)
+            end
+
+          _no_value ->
+            :ok
+        end
+      end
+    end)
+  end
+end
+
 # config/runtime.exs is executed for all environments, including
 # during releases. It is executed after compilation and before the
 # system starts, so it is typically used to load production configuration
@@ -20,6 +52,75 @@ if System.get_env("PHX_SERVER") do
   config :marrylocal, MarrylocalWeb.Endpoint, server: true
 end
 
+# Every account-facing link (confirmation, magic link, password reset) is built
+# from this value. It is read at runtime so no environment-specific URL is ever
+# compiled into a release.
+config :marrylocal, Marrylocal.Accounts,
+  frontend_url: System.get_env("FRONTEND_URL", "http://localhost:5173")
+
+config :marrylocal, :billing,
+  default_annual_fee_inr: String.to_integer(System.get_env("DEFAULT_ANNUAL_FEE_INR") || "500")
+
+# Cloudflare R2 is S3-compatible. Values are read at runtime so dev/test can
+# run without production credentials, while deployments override the account
+# endpoint, bucket, and public asset host through the environment.
+get_env = fn key ->
+  case System.get_env(key) do
+    nil -> nil
+    value -> String.trim(value)
+  end
+end
+
+r2_scheme = get_env.("AWS_S3_SCHEME") || "https://"
+
+r2_host =
+  get_env.("AWS_S3_HOST") ||
+    get_env.("R2_ENDPOINT_HOST") ||
+    "47701ef2e87f29505064cb21fd2513ed.r2.cloudflarestorage.com"
+
+r2_bucket = get_env.("AWS_S3_BUCKET") || "marrylocal"
+
+r2_asset_host =
+  get_env.("AWS_S3_ASSET_HOST") ||
+    "https://pub-772bc6927d764480ac713068077a5b1e.r2.dev"
+
+r2_access_key_id = get_env.("AWS_ACCESS_KEY_ID") || get_env.("R2_ACCESS_KEY_ID")
+r2_secret_access_key = get_env.("AWS_SECRET_ACCESS_KEY") || get_env.("R2_SECRET_ACCESS_KEY")
+
+config :ex_aws,
+  access_key_id: r2_access_key_id,
+  secret_access_key: r2_secret_access_key,
+  region: get_env.("AWS_REGION") || "auto"
+
+config :ex_aws, :s3,
+  scheme: r2_scheme,
+  host: r2_host,
+  region: get_env.("AWS_REGION") || "auto"
+
+config :waffle,
+  storage: Waffle.Storage.S3,
+  bucket: r2_bucket,
+  asset_host: r2_asset_host
+
+config :marrylocal, :features,
+  hide_addons_marketplace:
+    System.get_env("HIDE_ADDONS_MARKPLACE") ||
+      System.get_env("HIDE_ADDONS_MARKETPLACE") ||
+      "true",
+  enforce_verification_gate: System.get_env("ENFORCE_VERIFICATION_GATE") == "true",
+  enforce_payment_gate: System.get_env("ENFORCE_PAYMENT_GATE") == "true"
+
+config :marrylocal, :toggles,
+  force_verification_override: System.get_env("FORCE_VERIFICATION_OVERRIDE") == "true"
+
+config :marrylocal, :phonepe,
+  merchant_id: System.get_env("PHONEPE_MERCHANT_ID"),
+  salt_key: System.get_env("PHONEPE_SALT_KEY"),
+  salt_index: System.get_env("PHONEPE_SALT_INDEX", "1"),
+  base_url:
+    System.get_env("PHONEPE_BASE_URL") ||
+      "https://api-preprod.phonepe.com/apis/pg-sandbox"
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
@@ -28,15 +129,12 @@ if config_env() == :prod do
       For example: ecto://USER:PASS@HOST/DATABASE
       """
 
-  maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
-
   config :marrylocal, Marrylocal.Repo,
-    # ssl: true,
     url: database_url,
-    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
-    # For machines with several cores, consider starting multiple pools of `pool_size`
-    # pool_count: 4,
-    socket_options: maybe_ipv6
+    pool_size: String.to_integer(System.get_env("DATABASE_POOL_SIZE") || "10"),
+    ssl: true,
+    ssl_opts: [verify: :verify_none],
+    socket_options: [keepalive: true]
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
@@ -116,4 +214,15 @@ if config_env() == :prod do
   #     config :swoosh, :api_client, Swoosh.ApiClient.Req
   #
   # See https://hexdocs.pm/swoosh/Swoosh.html#module-installation for details.
+end
+
+# Production and staging dispatch through Resend. Development and test use the
+# Local/Test adapters from config.exs and config/test.exs so Playwright never
+# burns real email quota.
+if config_env() in [:prod, :staging] do
+  config :marrylocal, Marrylocal.Mailer,
+    adapter: Swoosh.Adapters.Resend,
+    api_key: System.get_env("RESEND_API_KEY")
+
+  config :swoosh, api_client: Swoosh.ApiClient.Finch
 end

@@ -1,5 +1,9 @@
 defmodule MarrylocalWeb.UserRegistrationControllerTest do
+  # The Phoenix-rendered auth controllers were removed when the platform moved
+  # to the React + JSON bearer flow. This suite is retained for reference until
+  # the browser shell is rebuilt; the API registration suite lives elsewhere.
   use MarrylocalWeb.ConnCase, async: true
+  @moduletag :skip
 
   import Marrylocal.AccountsFixtures
 

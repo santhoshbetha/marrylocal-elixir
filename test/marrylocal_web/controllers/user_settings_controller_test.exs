@@ -1,5 +1,8 @@
 defmodule MarrylocalWeb.UserSettingsControllerTest do
+  # Settings is now a React screen backed by the JSON API. The Phoenix-rendered
+  # settings controller and templates are no longer part of this application.
   use MarrylocalWeb.ConnCase, async: true
+  @moduletag :skip
 
   alias Marrylocal.Accounts
   import Marrylocal.AccountsFixtures

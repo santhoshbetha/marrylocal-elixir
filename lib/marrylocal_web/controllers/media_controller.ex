@@ -2,6 +2,7 @@ defmodule MarrylocalWeb.MediaController do
   use MarrylocalWeb, :controller
 
   alias Marrylocal.Uploads.Media
+
   def delete(conn, %{"image_url" => image_url}) do
     user = conn.assigns.current_user
 

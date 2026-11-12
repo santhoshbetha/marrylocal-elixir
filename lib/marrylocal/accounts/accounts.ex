@@ -1,15 +1,52 @@
-defmodule Marrylocal.Accounts.Accounts do
+defmodule Marrylocal.Accounts do
   @moduledoc """
   The Accounts context.
   """
 
   import Ecto.Query, warn: false
-  import Scrivener, only: [paginate: 2]
+  alias Ecto.Multi
   alias Marrylocal.Repo
   alias Marrylocal.Accounts.Search
+  alias Marrylocal.Emails.UserEmail
+  alias Marrylocal.Mailer
 
-  alias Marrylocal.Accounts.{User, UserToken, UserNotifier}
+  alias Marrylocal.Accounts.{User, UserToken, UserNotifier, Subscription}
+  alias Marrylocal.Features
+  alias Marrylocal.Geo
   alias Marrylocal.DeletedUsers.DeletedUser
+
+  require Logger
+
+  @core_detail_fields [:first_name, :last_name, :language, :community]
+
+  # Avoid re-sending a reset email for repeated requests. The token itself stays
+  # valid for one hour, so a user who did receive the mail is not locked out.
+  @reset_password_cooldown_minutes 15
+
+  @doc """
+  Returns the configured frontend origin used to build links inside emails.
+
+  The value is read at runtime from `config :marrylocal, Marrylocal.Accounts,
+  frontend_url: ...`, so no production host is compiled into a release.
+  """
+  def frontend_url do
+    :marrylocal
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:frontend_url, "http://localhost:5173")
+    |> String.trim_trailing("/")
+  end
+
+  @doc "Builds the client confirmation link for an email-change token."
+  def email_change_url(token) do
+    query = URI.encode_query([{"type", "email_change"}, {"token", token}])
+    "#{frontend_url()}/auth/confirm?#{query}"
+  end
+
+  @doc "Builds the frontend link that activates a newly registered account."
+  def confirmation_url(token) do
+    query = URI.encode_query([{"token", token}])
+    "#{frontend_url()}/verify-email?#{query}"
+  end
 
   ## Database getters
 
@@ -63,7 +100,255 @@ defmodule Marrylocal.Accounts.Accounts do
   """
   def get_user!(id), do: Repo.get!(User, id)
 
+  @doc "Gets a live user by id, returning nil for missing/deleted accounts."
+  def get_user(id) do
+    case Repo.get(User, id) do
+      nil -> nil
+      %User{user_state: :deleted} -> nil
+      user -> user
+    end
+  end
+
+  @doc "Gets a user by short public identifier."
+  def get_user_by_shortid(shortid) when is_binary(shortid) do
+    Repo.get_by(User, shortid: shortid)
+  end
+
+  @doc "Gets a user by public handle. Case-insensitive."
+  def get_user_by_handle(handle) when is_binary(handle) do
+    trimmed = String.trim(handle)
+
+    from(u in User,
+      where: fragment("lower(?) = lower(?)", u.user_handle, ^trimmed)
+    )
+    |> Repo.one()
+  end
+
+  @doc """
+  Case-insensitive handle availability check.
+
+  `excluding_user_id` lets a user keep the handle they already own.
+  """
+  def handle_taken?(handle, excluding_user_id \\ nil)
+
+  def handle_taken?(handle, excluding_user_id) when is_binary(handle) do
+    trimmed = String.trim(handle)
+
+    query =
+      from(u in User,
+        where:
+          fragment("lower(?) = lower(?)", u.user_handle, ^trimmed) and
+            not is_nil(u.user_handle)
+      )
+
+    query =
+      if excluding_user_id do
+        from(u in query, where: u.id != ^excluding_user_id)
+      else
+        query
+      end
+
+    Repo.exists?(query)
+  end
+
+  def handle_taken?(_handle, _excluding_user_id), do: false
+
+  @doc "Returns every live user matching the given ids in one query."
+  def list_users_by_ids([]), do: []
+
+  def list_users_by_ids(ids) when is_list(ids) do
+    User
+    |> where([u], u.id in ^ids and u.user_state != :deleted)
+    |> Repo.all()
+  end
+
+  ## Admin user queries
+
+  @admin_user_limit 500
+
+  @doc """
+  Returns up to 500 users for the admin console, newest first.
+
+  Supports a semicolon-separated `query` across names, email, phone, handle, and
+  shortid, plus optional `state`/`city` filters. `"All"` and `"All Cities"` are
+  treated as no filter.
+  """
+  def admin_search_users(params \\ %{}) when is_map(params) do
+    params
+    |> admin_search_query()
+    |> Repo.all()
+  end
+
+  @doc "Builds the bounded admin search query without executing it."
+  def admin_search_query(params) when is_map(params) do
+    User
+    |> admin_apply_search(params["query"])
+    |> admin_apply_location(params["state"], params["city"])
+    |> order_by([u], desc: u.inserted_at, desc: u.id)
+    |> limit(@admin_user_limit)
+  end
+
+  @doc """
+  Finds one user by exact email, phone number, `@handle`, shortid, or id.
+
+  Returns `nil` when nothing matches so the controller can answer with 404.
+  """
+  def admin_lookup_user(query) when is_binary(query) do
+    value = query |> String.trim() |> String.trim_leading("@")
+
+    if value == "" do
+      nil
+    else
+      Repo.one(
+        from u in User,
+          where:
+            u.email == ^value or u.phone_number == ^value or u.user_handle == ^value or
+              u.shortid == ^value or fragment("?::text = ?", u.id, ^value),
+          limit: 1
+      )
+    end
+  end
+
+  def admin_lookup_user(_query), do: nil
+
+  @doc "Applies the administrative changeset to a single user."
+  def admin_update_user(%User{} = user, attrs) when is_map(attrs) do
+    user
+    |> User.admin_changeset(attrs)
+    |> Repo.update()
+  end
+
+  def admin_update_user(id, attrs) when is_map(attrs) do
+    case normalize_admin_user_id(id) do
+      nil ->
+        {:error, :not_found}
+
+      user_id ->
+        with {:ok, user} <- get_user_by_id(user_id) do
+          admin_update_user(user, attrs)
+        end
+    end
+  end
+
+  @doc """
+  Atomically applies whitelisted admin fields to every requested user.
+
+  Returns `{:ok, updated_count}`. Invalid values return `{:error, changeset}`;
+  a payload with no recognised keys returns `{:error, :no_updates}`.
+  """
+  def admin_bulk_update_users(user_ids, updates) when is_list(user_ids) and is_map(updates) do
+    ids =
+      user_ids
+      |> Enum.map(&normalize_admin_user_id/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    changeset = User.admin_changeset(%User{}, updates)
+
+    cond do
+      ids == [] ->
+        {:ok, 0}
+
+      not changeset.valid? ->
+        {:error, changeset}
+
+      changeset.changes == %{} ->
+        {:error, :no_updates}
+
+      true ->
+        {count, _rows} =
+          from(u in User, where: u.id in ^ids)
+          |> Repo.update_all(set: Map.to_list(changeset.changes))
+
+        {:ok, count}
+    end
+  end
+
+  defp admin_apply_search(query, search) when is_binary(search) do
+    terms =
+      search
+      |> String.split(";", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    condition =
+      Enum.reduce(terms, nil, fn term, acc ->
+        term_condition = admin_search_term(term)
+
+        if acc do
+          dynamic([u], ^acc or ^term_condition)
+        else
+          term_condition
+        end
+      end)
+
+    case condition do
+      nil -> query
+      condition -> where(query, ^condition)
+    end
+  end
+
+  defp admin_apply_search(query, _search), do: query
+
+  defp admin_search_term(term) do
+    pattern = "%" <> escape_like(term) <> "%"
+
+    dynamic(
+      [u],
+      ilike(u.first_name, ^pattern) or
+        ilike(u.last_name, ^pattern) or
+        ilike(u.email, ^pattern) or
+        ilike(u.phone_number, ^pattern) or
+        ilike(u.user_handle, ^pattern) or
+        ilike(u.shortid, ^pattern)
+    )
+  end
+
+  defp admin_apply_location(query, state, city) do
+    query
+    |> admin_filter_state(state)
+    |> admin_filter_city(city)
+  end
+
+  defp admin_filter_state(query, state) when is_binary(state) and state not in ["", "All"] do
+    where(query, [u], ilike(u.state, ^String.trim(state)))
+  end
+
+  defp admin_filter_state(query, _state), do: query
+
+  defp admin_filter_city(query, city)
+       when is_binary(city) and city not in ["", "All", "All Cities"] do
+    where(query, [u], ilike(u.city, ^String.trim(city)))
+  end
+
+  defp admin_filter_city(query, _city), do: query
+
+  defp normalize_admin_user_id(id) when is_integer(id), do: id
+
+  defp normalize_admin_user_id(id) when is_binary(id) do
+    case Integer.parse(String.trim(id)) do
+      {value, ""} -> value
+      _ -> nil
+    end
+  end
+
+  defp normalize_admin_user_id(_id), do: nil
+
+  defp escape_like(term) do
+    term
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
+  end
+
   ## User registration
+
+  defp configured_annual_fee do
+    case Application.get_env(:marrylocal, :billing, []) |> Keyword.get(:default_annual_fee_inr) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> 500
+    end
+  end
 
   @doc """
   Registers a user.
@@ -77,28 +362,211 @@ defmodule Marrylocal.Accounts.Accounts do
       {:error, %Ecto.Changeset{}}
 
   """
-  #def register_user(attrs) do
+
+  # def register_user(attrs) do
   #  %User{}
   #  |> User.email_changeset(attrs)
   #  |> Repo.insert()
-  #end
+  # end
 
   def register_user(attrs) do
-    Ecto.Multi.new()
-    |> Ecto.Multi.insert(:user, User.registration_changeset(%User{}, attrs))
-    |> Ecto.Multi.run(:schedule_job, fn _repo, %{user: user} ->
-        job = Marrylocal.Workers.DeletionReminder.new(
+    with {:ok, referrer} <- resolve_referrer(attrs) do
+      Ecto.Multi.new()
+      |> Ecto.Multi.insert(:user, fn _changes ->
+        changeset = User.registration_changeset(%User{}, attrs)
+
+        changeset =
+          Ecto.Changeset.put_change(
+            changeset,
+            :accepted_one_time_fees_amount,
+            configured_annual_fee()
+          )
+
+        if referrer do
+          Ecto.Changeset.put_change(changeset, :referred_by_id, referrer.id)
+        else
+          changeset
+        end
+      end)
+      |> Ecto.Multi.run(:referral_credit, fn repo, %{user: _user} ->
+        credit_referrer(repo, referrer)
+      end)
+      |> Ecto.Multi.run(:schedule_job, fn _repo, %{user: user} ->
+        schedule_deletion_reminder(user)
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{user: user}} ->
+          case evaluate_gating(user) do
+            {:ok, evaluated} -> {:ok, evaluated}
+            _ -> {:ok, user}
+          end
+
+        {:error, :user, changeset, _} ->
+          {:error, changeset}
+
+        {:error, :referral_credit, reason, _} ->
+          {:error, reason}
+
+        {:error, :schedule_job, reason, _} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Returns the authenticated user's referral code, earned credit value, and the
+  people who joined with that code.
+  """
+  def referral_summary(user_id) do
+    user = Repo.get!(User, user_id)
+
+    referrals =
+      from(u in User,
+        where: u.referred_by_id == ^user_id,
+        order_by: [desc: u.inserted_at],
+        select: %{id: u.id, first_name: u.first_name, inserted_at: u.inserted_at}
+      )
+      |> Repo.all()
+      |> Enum.map(&Map.put(&1, :credit_value_inr, 50))
+
+    credits_count = user.referral_credits_count || 0
+
+    %{
+      referral_code: user.referral_code,
+      credits_count: credits_count,
+      credit_value_inr: credits_count * 50,
+      referrals: referrals
+    }
+  end
+
+  defp resolve_referrer(attrs) do
+    code = attrs["referred_by_code"] || attrs[:referred_by_code]
+
+    if is_binary(code) and String.trim(code) != "" do
+      case Repo.get_by(User, referral_code: String.upcase(String.trim(code))) do
+        nil ->
+          {:error, :invalid_referral_code}
+
+        referrer ->
+          email = attrs["email"] || attrs[:email]
+
+          if is_binary(email) and String.downcase(referrer.email) == String.downcase(email) do
+            {:error, :self_referral_not_allowed}
+          else
+            {:ok, referrer}
+          end
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp credit_referrer(_repo, nil), do: {:ok, nil}
+
+  defp credit_referrer(repo, referrer) do
+    {updated, _rows} =
+      from(u in User, where: u.id == ^referrer.id)
+      |> repo.update_all(inc: [referral_credits_count: 1])
+
+    if updated == 1, do: {:ok, nil}, else: {:error, :referrer_not_found}
+  end
+
+  @doc """
+  Activates paid addon features on the server after a verified payment event.
+
+  The client never supplies dates or subscription status. A monthly interval is
+  calculated from the server's UTC date and persisted on the subscription row.
+  """
+  def activate_subscription(user_id, items, start_date \\ Date.utc_today())
+      when is_map(items) do
+    case Repo.get(User, user_id) do
+      nil ->
+        {:error, :user_not_found}
+
+      %User{} = user ->
+        end_date = Date.add(start_date, 30)
+        valid_until = DateTime.new!(end_date, ~T[23:59:59], "Etc/UTC")
+        community_active = items["community_search"] == true || user.community_search_active
+        slots = merge_location_slots(user.multi_location_slots || %{}, items)
+        addons = merge_legacy_addons(user.addons || %{}, items, community_active)
+
+        Repo.transaction(fn ->
+          {:ok, updated_user} =
+            user
+            |> Ecto.Changeset.change(%{
+              community_search_active: community_active,
+              multi_location_slots: slots,
+              addons: addons
+            })
+            |> Repo.update()
+
+          subscription =
+            Repo.get_by(Subscription, user_id: user.id) ||
+              %Subscription{user_id: user.id}
+
+          {:ok, subscription} =
+            subscription
+            |> Subscription.changeset(%{
+              status: "active",
+              valid_until: valid_until,
+              info: %{
+                "start_date" => Date.to_iso8601(start_date),
+                "end_date" => Date.to_iso8601(end_date),
+                "items" => items
+              }
+            })
+            |> Repo.insert_or_update()
+
+          %{user: updated_user, subscription: subscription}
+        end)
+    end
+  end
+
+  defp merge_location_slots(slots, items) do
+    slots
+    |> maybe_put_location("location2", items["location2"])
+    |> maybe_put_location("location3", items["location3"])
+  end
+
+  defp maybe_put_location(slots, key, %{"city" => city, "state" => state})
+       when is_binary(city) and is_binary(state) and city != "" do
+    Map.put(slots, key, %{"city" => city, "state" => state})
+  end
+
+  defp maybe_put_location(slots, _key, _value), do: slots
+
+  defp merge_legacy_addons(addons, items, community_active) do
+    addons
+    |> Map.delete("fullcitySearch")
+    |> Map.put("communitySearch", community_active)
+    |> put_legacy_location("location2", items["location2"], "city2", "state2")
+    |> put_legacy_location("location3", items["location3"], "city3", "state3")
+  end
+
+  defp put_legacy_location(addons, key, %{"city" => city, "state" => state}, city_key, state_key)
+       when is_binary(city) and is_binary(state) and city != "" do
+    Map.put(addons, key, %{city_key => city, state_key => state})
+  end
+
+  defp put_legacy_location(addons, _key, _value, _city_key, _state_key), do: addons
+
+  # Oban's manual test mode must not open a second checked-out connection
+  # inside the SQL sandbox transaction, so the reminder is a no-op there.
+  defp schedule_deletion_reminder(user) do
+    if Keyword.get(Application.get_env(:marrylocal, Oban, []), :testing) == :manual do
+      {:ok, :skipped}
+    else
+      job =
+        Marrylocal.Workers.DeletionReminder.new(
           %{user_id: user.id},
           schedule_in: 6 * 24 * 60 * 60
         )
-        Oban.insert(job)
-      end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{user: user}} -> {:ok, user} # Return just the user so your controller doesn't break
-      {:error, :user, changeset, _} -> {:error, changeset}
+
+      Oban.insert(job)
     end
   end
+
   ## Settings
 
   @doc """
@@ -186,23 +654,93 @@ defmodule Marrylocal.Accounts.Accounts do
     |> update_user_and_delete_all_tokens()
   end
 
-  #Function generates the token, saves it to the user_tokens table, and fires the email.
-  def deliver_user_reset_password_instructions(user, reset_password_url_fun) do
-    # Generate a 32-byte random token
-    encoded_token = UserToken.build_email_token(user, "reset_password")
+  @doc """
+  Generates a password-reset token, stores only its SHA-256 hash, and delivers
+  the reset link to the user's email.
 
-    # Send the email with the token injected into the URL
-    UserEmail.reset_password_instructions(user, reset_password_url_fun.(encoded_token))
-    |> Mailer.deliver()
+  Repeated requests within 15 minutes return `{:error, :already_sent_recently}`
+  so callers can keep their response enumeration-safe without re-sending mail.
+  """
+  def deliver_user_reset_password_instructions(user, reset_password_url_fun)
+      when is_function(reset_password_url_fun, 1) do
+    if reset_password_email_sent_recently?(user) do
+      {:error, :already_sent_recently}
+    else
+      {encoded_token, user_token} = UserToken.build_email_token(user, "reset_password")
+      Repo.insert!(user_token)
+
+      user
+      |> UserEmail.reset_password_instructions(reset_password_url_fun.(encoded_token))
+      |> Mailer.deliver()
+    end
   end
 
-  # Same as `update_user_password/2` but does not require the current password to be valid.
-  def reset_user_password(user, token, attrs) do
+  defp reset_password_email_sent_recently?(user) do
+    cutoff = DateTime.add(DateTime.utc_now(:second), -@reset_password_cooldown_minutes, :minute)
+
+    Repo.exists?(
+      from t in UserToken,
+        where:
+          t.user_id == ^user.id and t.context == "reset_password" and
+            t.inserted_at > ^cutoff
+    )
+  end
+
+  @doc """
+  Same as `update_user_password/2` but does not require the current password.
+
+  Only call this after `get_user_by_reset_password_token/1` has verified the
+  emailed token. The password update and the revocation of every token owned by
+  the user run in one transaction, so a failed update cannot leave live sessions
+  behind.
+  """
+  def reset_user_password(%User{} = user, attrs) do
     Multi.new()
-    |> Multi.update(:user, User.password_reset_changeset(user, attrs))
-    |> Multi.delete_all(:tokens, UserToken.user_and_contexts_query(user, ["reset_password"]))
+    |> Multi.update(:user, User.password_changeset(user, attrs))
+    |> Multi.delete_all(:tokens, UserToken.by_user_and_contexts_query(user, :all))
     |> Repo.transaction()
+    |> case do
+      {:ok, %{user: user}} -> {:ok, user}
+      {:error, :user, changeset, _changes} -> {:error, changeset}
+    end
   end
+
+  # Backwards-compatible arity kept for callers that still pass the raw token.
+  @doc false
+  def reset_user_password(%User{} = user, _token, attrs), do: reset_user_password(user, attrs)
+
+  @doc "Gets the user by a valid password-reset token."
+  def get_user_by_reset_password_token(token) do
+    with {:ok, query} <- UserToken.verify_email_token_query(token, "reset_password"),
+         %User{} = user <- Repo.one(query) do
+      {:ok, user}
+    else
+      _ -> :error
+    end
+  end
+
+  @doc """
+  Confirms a user's email address from a single-use confirmation token.
+
+  Confirmation consumes every token owned by the user, including any session
+  created at registration. The caller can then issue a fresh bearer token.
+  """
+  def confirm_user_by_token(token) when is_binary(token) do
+    with {:ok, query} <- UserToken.verify_email_token_query(token, "confirm"),
+         %User{} = user <- Repo.one(query) do
+      user
+      |> User.confirm_changeset()
+      |> update_user_and_delete_all_tokens()
+      |> case do
+        {:ok, {user, _expired_tokens}} -> {:ok, user}
+        {:error, changeset} -> {:error, changeset}
+      end
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def confirm_user_by_token(_token), do: {:error, :not_found}
 
   ## Session
 
@@ -216,13 +754,60 @@ defmodule Marrylocal.Accounts.Accounts do
   end
 
   @doc """
-  Gets the user with the given signed token.
+  Marks a successful sign-in and refreshes presence-facing timestamps.
+  """
+  def record_login(%User{} = user) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-  If the token is valid `{user, token_inserted_at}` is returned, otherwise `nil` is returned.
+    user
+    |> Ecto.Changeset.change(
+      time_of_login: now,
+      last_login_at: now,
+      last_seen_at: now
+    )
+    |> Repo.update()
+    |> case do
+      {:ok, updated} -> updated
+      {:error, _changeset} -> user
+    end
+  end
+
+  @doc """
+  Refreshes a user's last-seen timestamp during token validation or a socket
+  handshake. Writes are throttled to once per minute per user.
+  """
+  def touch_last_seen(%User{} = user) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    cutoff = DateTime.add(now, -60, :second)
+
+    Repo.update_all(
+      from(u in User,
+        where:
+          u.id == ^user.id and
+            (is_nil(u.last_seen_at) or u.last_seen_at < ^cutoff)
+      ),
+      set: [last_seen_at: now, last_active_at: now]
+    )
+
+    :ok
+  end
+
+  @doc """
+  Gets the user with the given opaque bearer token.
+
+  If the token is valid `{user, token_inserted_at}` is returned, otherwise `nil`.
+  Only a SHA-256 hash of the token exists in Postgres.
   """
   def get_user_by_session_token(token) do
-    {:ok, query} = UserToken.verify_session_token_query(token)
-    Repo.one(query)
+    case UserToken.verify_session_token_query(token) do
+      {:ok, query} -> Repo.one(query)
+      :error -> nil
+    end
+  end
+
+  @doc "Generates the short-lived Phoenix token used only for the WebSocket handshake."
+  def generate_websocket_token(%User{} = user) do
+    Phoenix.Token.sign(MarrylocalWeb.Endpoint, "user socket", user.id)
   end
 
   @doc """
@@ -311,11 +896,27 @@ defmodule Marrylocal.Accounts.Accounts do
   end
 
   @doc """
+  Delivers the account confirmation instructions for a newly registered user.
+  """
+  def deliver_confirmation_instructions(%User{} = user, confirmation_url_fun)
+      when is_function(confirmation_url_fun, 1) do
+    {encoded_token, user_token} = UserToken.build_email_token(user, "confirm")
+    Repo.insert!(user_token)
+    UserNotifier.deliver_confirmation_instructions(user, confirmation_url_fun.(encoded_token))
+  end
+
+  @doc """
   Deletes the signed token with the given context.
   """
   def delete_user_session_token(token) do
-    Repo.delete_all(from(UserToken, where: [token: ^token, context: "session"]))
-    :ok
+    case UserToken.hash_session_token(token) do
+      {:ok, hashed_token} ->
+        Repo.delete_all(from(UserToken, where: [token: ^hashed_token, context: "session"]))
+        :ok
+
+      :error ->
+        :ok
+    end
   end
 
   ## Token helper
@@ -335,20 +936,33 @@ defmodule Marrylocal.Accounts.Accounts do
   def notify_nearby_users(new_user) do
     # 1. Find active users within 10km who have a push_token
     nearby_users =
-      Search.list_users(new_user.latitude, new_user.longitude, %{"distance" => 10})
+      Search.list_users(%{
+        "latitude" => new_user.latitude,
+        "longitude" => new_user.longitude,
+        "distance" => 10
+      }).entries
       |> Enum.filter(&(&1.push_token != nil))
 
     # 2. Send notifications in the background
     Task.start(fn ->
       Enum.each(nearby_users, fn user ->
-        Marrylocal.Notifications.send_channel_notification(user.id, "Someone new is nearby!", "#{new_user.first_name} just joined.")
+        Marrylocal.Notifications.send_channel_notification(
+          user.id,
+          "Someone new is nearby!",
+          "#{new_user.first_name} just joined."
+        )
       end)
     end)
   end
 
   def broadcast_nearby_join(new_user) do
     # Find users within 30km (using your Search logic)
-    nearby_users = Search.list_users(new_user.latitude, new_user.longitude, %{"distance" => 30})
+    nearby_users =
+      Search.list_users(%{
+        "latitude" => new_user.latitude,
+        "longitude" => new_user.longitude,
+        "distance" => 30
+      }).entries
 
     Enum.each(nearby_users, fn user ->
       MarrylocalWeb.Endpoint.broadcast("notifications:#{user.id}", "new_nearby_user", %{
@@ -361,10 +975,12 @@ defmodule Marrylocal.Accounts.Accounts do
   def check_mutual_match(current_user, target_user) do
     # Check if target user has current user's shortid in their array
     # Uses the PostgreSQL "contains" operator (@>) via Ecto fragment
-    query = from u in User,
-      where: u.shortid == ^target_user.shortid and
-             fragment("? @> ARRAY[?]", u.shortlist, ^current_user.shortid),
-      select: count(u.id)
+    query =
+      from u in User,
+        where:
+          u.shortid == ^target_user.shortid and
+            fragment("? @> ARRAY[?]", u.shortlist, ^current_user.shortid),
+        select: count(u.id)
 
     case Repo.one(query) do
       1 -> {:ok, :mutual_match}
@@ -372,18 +988,276 @@ defmodule Marrylocal.Accounts.Accounts do
     end
   end
 
-  #Profile update:
+  # Profile update:
   def update_user_profile(user, attrs) do
     user
     |> User.profile_changeset(attrs)
     |> Repo.update()
   end
 
-  def update_user_coordinates(user, attrs) do
+  @doc """
+  Stores a validated multipart avatar through Waffle into Cloudflare R2.
+
+  Only `%Plug.Upload{}` values reach the changeset; client-supplied path strings
+  are rejected by the Waffle.Ecto type.
+  """
+  def update_avatar(%User{} = user, attrs) do
     user
-    |> User.location_changeset(attrs)
+    |> User.avatar_changeset(attrs)
     |> Repo.update()
   end
+
+  @doc "Clears the avatar reference. The R2 object is left for lifecycle cleanup."
+  def clear_avatar(%User{} = user) do
+    user
+    |> Ecto.Changeset.change(avatar: nil)
+    |> Repo.update()
+  end
+
+  @max_profile_photos 10
+
+  @doc """
+  Writes a gallery photo URL into the exact `images[slot_index]` position.
+
+  Slots are zero-based and stable: uploading to slot 4 keeps slots 0-3 and the
+  remaining slots untouched. Missing intermediate positions are padded with nil
+  so the client can keep rendering a fixed ten-cell grid.
+  """
+  def update_user_image_at_slot(%User{} = user, image_url, slot_index)
+      when is_integer(slot_index) and slot_index >= 0 and slot_index < @max_profile_photos and
+             is_binary(image_url) do
+    images =
+      user.images
+      |> List.wrap()
+      |> pad_images_to_slot(slot_index)
+      |> List.replace_at(slot_index, image_url)
+
+    user
+    |> User.add_image_changeset(%{images: images})
+    |> Repo.update()
+  end
+
+  def update_user_image_at_slot(_user, _image_url, _slot_index),
+    do: {:error, :invalid_slot_index}
+
+  @doc """
+  Clears `images[slot_index]` without re-indexing the remaining photos.
+
+  Indices stay stable so slot 4 does not become slot 3. Trailing nils are
+  trimmed so the persisted array does not grow forever.
+  """
+  def clear_user_image_at_slot(%User{} = user, slot_index)
+      when is_integer(slot_index) and slot_index >= 0 and slot_index < @max_profile_photos do
+    images = List.wrap(user.images)
+
+    images =
+      if slot_index < length(images) do
+        images
+        |> List.replace_at(slot_index, nil)
+        |> trim_trailing_nil_images()
+      else
+        images
+      end
+
+    user
+    |> User.add_image_changeset(%{images: images})
+    |> Repo.update()
+  end
+
+  def clear_user_image_at_slot(_user, _slot_index), do: {:error, :invalid_slot_index}
+
+  defp pad_images_to_slot(images, slot_index) do
+    missing = slot_index + 1 - length(images)
+    if missing > 0, do: images ++ List.duplicate(nil, missing), else: images
+  end
+
+  defp trim_trailing_nil_images(images) do
+    images
+    |> Enum.reverse()
+    |> Enum.drop_while(&is_nil/1)
+    |> Enum.reverse()
+  end
+
+  @location_cooldown_days 30
+
+  @doc "Returns the next server-authorized location change time."
+  def location_change_allowed_at(%User{date_of_location: nil}), do: nil
+
+  def location_change_allowed_at(%User{date_of_location: date_of_location}) do
+    DateTime.add(date_of_location, @location_cooldown_days, :day)
+  end
+
+  @doc "True while the server-side monthly location cooldown is active."
+  def location_change_locked?(%User{} = user) do
+    case location_change_allowed_at(user) do
+      nil -> false
+      allowed_at -> DateTime.compare(allowed_at, DateTime.utc_now()) == :gt
+    end
+  end
+
+  @doc """
+  Server-side density evaluator. Calculates opposite-gender city and 50km
+  metrics and persists the resulting annual-fee / verification gates.
+  """
+  def evaluate_gating(%User{} = user) do
+    case opposite_gender(user.gender) do
+      nil ->
+        {:ok, user}
+
+      opposite ->
+        city_count =
+          if is_binary(user.city) do
+            from(u in User,
+              where:
+                u.id != ^user.id and u.user_state == :active and u.gender == ^opposite and
+                  fragment("lower(?) = lower(?)", u.city, ^user.city)
+            )
+            |> Repo.aggregate(:count, :id)
+          else
+            0
+          end
+
+        around_count =
+          case Geo.point_for(user) do
+            {:ok, point} ->
+              from(u in User,
+                where: u.id != ^user.id and u.user_state == :active and u.gender == ^opposite
+              )
+              |> Geo.within_radius(point, 50)
+              |> Repo.aggregate(:count, :id)
+
+            :error ->
+              0
+          end
+
+        is_id_verified =
+          user.aadhar_verified || user.passport_verified || user.license_verified
+
+        days_since_creation =
+          case user.inserted_at do
+            %DateTime{} = inserted_at ->
+              DateTime.diff(DateTime.utc_now(), inserted_at, :day) > 7
+
+            _ ->
+              false
+          end
+
+        force_verification_required =
+          Features.enforce_verification_gate?() and not is_id_verified and
+            days_since_creation and around_count > 50
+
+        onetime_fees_required = user.onetime_fees_required || city_count > 250
+        payment_expired? = user.onetime_fees_paid and annual_payment_expired?(user)
+
+        onetime_fees_paid =
+          if payment_expired?, do: false, else: user.onetime_fees_paid
+
+        onetime_fees_required =
+          if payment_expired?, do: true, else: onetime_fees_required
+
+        user
+        |> Ecto.Changeset.change(%{
+          onetime_fees_paid: onetime_fees_paid,
+          onetime_fees_required: onetime_fees_required,
+          around_user_count: around_count,
+          force_verification_required: force_verification_required
+        })
+        |> Repo.update()
+    end
+  end
+
+  @doc "Refreshes gating fields, returning the original user if the evaluation fails."
+  def refresh_gating(%User{} = user) do
+    case evaluate_gating(user) do
+      {:ok, updated} -> updated
+      _ -> user
+    end
+  end
+
+  defp opposite_gender("Male"), do: "Female"
+  defp opposite_gender("Female"), do: "Male"
+  defp opposite_gender(_gender), do: nil
+
+  defp annual_payment_expired?(%User{last_payment_at: %DateTime{} = paid_at}) do
+    DateTime.diff(DateTime.utc_now(), paid_at, :day) > 365
+  end
+
+  defp annual_payment_expired?(%User{
+         last_payment_at: nil,
+         date_of_last_payment: %Date{} = paid_on
+       }) do
+    Date.diff(Date.utc_today(), paid_on) > 365
+  end
+
+  defp annual_payment_expired?(_user), do: false
+
+  @doc """
+  Atomically updates lifestyle/profile fields and, when coordinates are
+  supplied, the native PostGIS geography point.
+
+  A coordinate-changing call is rejected while the server-side 30-day location
+  cooldown is active.
+  """
+  def update_profile_and_location(%User{} = user, profile_attrs, coords \\ nil) do
+    if coords && location_change_locked?(user) do
+      {:error, :location_change_locked}
+    else
+      profile_changeset = User.profile_changeset(user, profile_attrs)
+
+      core_changed? =
+        Enum.any?(@core_detail_fields, &Map.has_key?(profile_changeset.changes, &1))
+
+      if user.core_details_edited and core_changed? do
+        {:error, :core_details_locked}
+      else
+        profile_changeset =
+          if core_changed? do
+            Ecto.Changeset.put_change(profile_changeset, :core_details_edited, true)
+          else
+            profile_changeset
+          end
+
+        result =
+          Repo.transaction(fn ->
+            with {:ok, updated} <- Repo.update(profile_changeset),
+                 {:ok, updated} <- maybe_update_coords(updated, coords) do
+              updated
+            else
+              {:error, changeset} -> Repo.rollback(changeset)
+            end
+          end)
+
+        case result do
+          {:ok, updated} -> evaluate_gating(updated)
+          {:error, reason} -> {:error, reason}
+        end
+      end
+    end
+  end
+
+  defp maybe_update_coords(user, nil), do: {:ok, user}
+
+  defp maybe_update_coords(user, %{} = coords) do
+    user
+    |> User.location_changeset(%{
+      latitude: coords["latitude"] || coords[:latitude],
+      longitude: coords["longitude"] || coords[:longitude]
+    })
+    |> Repo.update()
+  end
+
+  def update_user_coordinates(user, attrs) do
+    case user
+         |> User.location_changeset(attrs)
+         |> Repo.update() do
+      {:ok, updated} -> evaluate_gating(updated)
+      error -> error
+    end
+  end
+
+  @doc "Delegates to the shared 5 km coordinate fuzzing boundary."
+  def fuzz_coordinates(latitude, longitude),
+    do: Marrylocal.Geo.fuzz_coordinates(latitude, longitude)
 
   # Once the user pays, you should have a separate internal method to
   # clear the flag so they can finally update their location:
@@ -434,11 +1308,16 @@ defmodule Marrylocal.Accounts.Accounts do
     |> where([u], u.gender == ^target_gender)
     |> where([u], u.user_state == :active)
     # Fragment for PostGIS radius check
-    |> where([u], fragment(
+    |> where(
+      [u],
+      fragment(
         "ST_DWithin(ST_SetSRID(ST_MakePoint(u.longitude, u.latitude), 4326)::geography,
                     ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, ?)",
-        ^current_user.longitude, ^current_user.latitude, ^radius_m
-      ))
+        ^current_user.longitude,
+        ^current_user.latitude,
+        ^radius_m
+      )
+    )
     |> Repo.aggregate(:count, :id)
   end
 
@@ -450,13 +1329,14 @@ defmodule Marrylocal.Accounts.Accounts do
     |> Repo.aggregate(:count, :id)
   end
 
-  #function now enforces a max limit of 8 and ignores further referrals once reached.
+  # function now enforces a max limit of 8 and ignores further referrals once reached.
   def append_to_referee_emails(referral_code, new_email) do
     Repo.transaction(fn ->
       referrer = Repo.get_by!(User, referral_code: referral_code)
 
       # 1. ENFORCE LIMIT: Max 8 referrals
       current_count = Enum.count(referrer.referee_emails || [])
+
       if current_count >= 8 do
         Repo.rollback(:referral_limit_reached)
       end
@@ -467,7 +1347,7 @@ defmodule Marrylocal.Accounts.Accounts do
       end
 
       # 3. Update list (Unique emails only)
-      new_list = [new_email | (referrer.referee_emails || [])] |> Enum.uniq()
+      new_list = [new_email | referrer.referee_emails || []] |> Enum.uniq()
 
       referrer
       |> Ecto.Changeset.change(referee_emails: new_list)
@@ -495,13 +1375,15 @@ defmodule Marrylocal.Accounts.Accounts do
 
   def add_to_shortlist(current_user, target_shortid) do
     case Repo.get_by(User, shortid: target_shortid) do
-      nil -> {:error, :not_found}
+      nil ->
+        {:error, :not_found}
 
       _target ->
         # Only update if the shortid is NOT already in the array
         from(u in User,
-          where: u.id == ^current_user.id and
-                fragment("NOT (? @> ARRAY[?])", u.shortlist, ^target_shortid)
+          where:
+            u.id == ^current_user.id and
+              fragment("NOT (? @> ARRAY[?])", u.shortlist, ^target_shortid)
         )
         |> Repo.update_all(push: [shortlist: target_shortid])
 
@@ -509,12 +1391,13 @@ defmodule Marrylocal.Accounts.Accounts do
     end
   end
 
-  #function targets the shortlist array and removes all instances of the specific target_shortid.
+  # function targets the shortlist array and removes all instances of the specific target_shortid.
   def remove_from_shortlist(current_user, target_shortid) do
     # The entire query (where + update) should be inside the from()
-    query = from u in User,
-      where: u.id == ^current_user.id,
-      update: [set: [shortlist: fragment("array_remove(shortlist, ?)", ^target_shortid)]]
+    query =
+      from u in User,
+        where: u.id == ^current_user.id,
+        update: [set: [shortlist: fragment("array_remove(shortlist, ?)", ^target_shortid)]]
 
     Repo.update_all(query, [])
 
@@ -522,9 +1405,11 @@ defmodule Marrylocal.Accounts.Accounts do
   end
 
   def list_shortlisted_users1(shortid_list, params \\ %{}) do
-    query = User
+    query =
+      User
       |> where([u], u.shortid in ^shortid_list)
-      |> where([u], u.user_state == :active) # Only show active users
+      # Only show active users
+      |> where([u], u.user_state == :active)
 
     Repo.paginate(query, page: params["page"] || 1)
   end
@@ -535,7 +1420,8 @@ defmodule Marrylocal.Accounts.Accounts do
   def list_shortlisted_users(current_user, params \\ %{}) do
     shortid_list = current_user.shortlist || []
 
-    query = User
+    query =
+      User
       |> where([u], u.shortid in ^shortid_list)
       |> where([u], u.user_state == :active)
       # Select a virtual field 'is_mutual' by checking if
@@ -577,7 +1463,6 @@ defmodule Marrylocal.Accounts.Accounts do
 
     # 4. Clear the images array in the DB (since files will be gone from R2)
     |> Ecto.Multi.update(:clear_images, User.changeset(user, %{images: []}))
-
     |> Repo.transaction()
   end
 
@@ -593,47 +1478,26 @@ defmodule Marrylocal.Accounts.Accounts do
     |> Repo.update()
   end
 
-  #Database Level Throttling (Extra Safety)
-  # extremely aggressive about cost-saving, you can check the database to see when the last
-  # reset_password token was created. If it was less than 15 minutes ago, don't even call the Mailer.
-  def deliver_user_reset_password_instructions2(user, url_fun) do
-    import Ecto.Query
-
-    # Check if a token was sent in the last 15 minutes
-    fifteen_mins_ago = DateTime.utc_now() |> DateTime.add(-15, :minute)
-
-    recent_token_exists = Repo.exists?(
-      from t in UserToken,
-      where: t.user_id == ^user.id and t.context == "reset_password" and t.inserted_at > ^fifteen_mins_ago
-    )
-
-    if recent_token_exists do
-      {:error, :already_sent_recently}
-    else
-      # ... generate token and send email logic ...
-    end
-  end
-
   def register_admin(attrs) do
     %User{}
     |> User.admin_registration_changeset(attrs)
     |> Repo.insert()
   end
 
-
-  #Images:
+  # Images:
   def generate_presigned_url(filename) do
     # Generate a unique path: "uploads/users/shortid/filename.jpg"
     s3_path = "uploads/#{filename}"
 
     # Generate a PUT URL valid for 1 hour
-    {:ok, url} = ExAws.S3.presigned_url(
-      ExAws.Config.new(:s3),
-      :put,
-      "your-bucket-name",
-      s3_path,
-      expires_in: 3600
-    )
+    {:ok, url} =
+      ExAws.S3.presigned_url(
+        ExAws.Config.new(:s3),
+        :put,
+        "your-bucket-name",
+        s3_path,
+        expires_in: 3600
+      )
 
     {:ok, %{upload_url: url, public_url: "https://your-bucket.s3.amazonaws.com/#{s3_path}"}}
   end

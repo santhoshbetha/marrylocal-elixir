@@ -5,7 +5,7 @@ defmodule MarrylocalWeb.SettingsController do
   import MarrylocalWeb.UserAuth, only: [require_sudo_mode: 2]
 
   plug :require_sudo_mode
-  #plug :assign_email_and_password_changesets
+  # plug :assign_email_and_password_changesets
 
   # 1. Update Email
   def update(conn, %{"action" => "update_email", "user" => user_params}) do
@@ -73,5 +73,4 @@ defmodule MarrylocalWeb.SettingsController do
       end)
     end)
   end
-
 end

@@ -5,7 +5,8 @@ defmodule Marrylocal.Uploads.Media do
   alias Marrylocal.Accounts.User
 
   @bucket "marrylocal-images"
-  @public_domain "https://pub-xyz.r2.dev" # Your R2 Public Bucket URL
+  # Your R2 Public Bucket URL
+  @public_domain "https://pub-xyz.r2.dev"
 
   def generate_upload_params(user, filename) do
     # Create a unique path using the user's shortid
@@ -17,13 +18,14 @@ defmodule Marrylocal.Uploads.Media do
     config = ExAws.Config.new(:s3)
     {:ok, url} = S3.presigned_url(config, :put, @bucket, object_key, expires_in: 1800)
 
-    {:ok, %{
-      upload_url: url,
-      image_url: "#{@public_domain}/#{object_key}"
-    }}
+    {:ok,
+     %{
+       upload_url: url,
+       image_url: "#{@public_domain}/#{object_key}"
+     }}
   end
 
-  #Adding to the images Array
+  # Adding to the images Array
   def confirm_image_upload(user, image_url) do
     from(u in User, where: u.id == ^user.id)
     |> Repo.update_all(push: [images: image_url])

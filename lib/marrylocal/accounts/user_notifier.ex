@@ -9,7 +9,7 @@ defmodule Marrylocal.Accounts.UserNotifier do
     email =
       new()
       |> to(recipient)
-      |> from({"Marrylocal", "contact@example.com"})
+      |> from({"Marrylocal", "noreply@marrylocal.in"})
       |> subject(subject)
       |> text_body(body)
 
@@ -65,7 +65,10 @@ defmodule Marrylocal.Accounts.UserNotifier do
     """)
   end
 
-  defp deliver_confirmation_instructions(user, url) do
+  @doc """
+  Deliver account confirmation instructions.
+  """
+  def deliver_confirmation_instructions(user, url) do
     deliver(user.email, "Confirmation instructions", """
 
     ==============================

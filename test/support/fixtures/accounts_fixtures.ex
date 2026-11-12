@@ -8,13 +8,25 @@ defmodule Marrylocal.AccountsFixtures do
 
   alias Marrylocal.Accounts
   alias Marrylocal.Accounts.Scope
+  alias Marrylocal.Repo
 
   def unique_user_email, do: "user#{System.unique_integer()}@example.com"
   def valid_user_password, do: "hello world!"
 
   def valid_user_attributes(attrs \\ %{}) do
+    suffix = System.unique_integer([:positive])
+    phone_suffix = rem(suffix, 1_000_000_000)
+
     Enum.into(attrs, %{
-      email: unique_user_email()
+      email: unique_user_email(),
+      phone_number: "+9198#{phone_suffix}",
+      date_of_birth: ~D[1995-01-01],
+      first_name: "Test",
+      last_name: "User",
+      gender: "Female",
+      user_handle: "testuser#{suffix}",
+      password: valid_user_password(),
+      password_confirmation: valid_user_password()
     })
   end
 
@@ -23,6 +35,14 @@ defmodule Marrylocal.AccountsFixtures do
       attrs
       |> valid_user_attributes()
       |> Accounts.register_user()
+
+    # The legacy auth tests model magic-link-first accounts. Strip the password
+    # so `login_user_by_magic_link/1` exercises the confirmation path; tests
+    # that need password login call `set_password/1` explicitly.
+    {:ok, user} =
+      user
+      |> Ecto.Changeset.change(hashed_password: nil)
+      |> Repo.update()
 
     user
   end
@@ -64,9 +84,11 @@ defmodule Marrylocal.AccountsFixtures do
   end
 
   def override_token_authenticated_at(token, authenticated_at) when is_binary(token) do
-    Marrylocal.Repo.update_all(
+    {:ok, hashed_token} = Accounts.UserToken.hash_session_token(token)
+
+    Repo.update_all(
       from(t in Accounts.UserToken,
-        where: t.token == ^token
+        where: t.token == ^hashed_token
       ),
       set: [authenticated_at: authenticated_at]
     )
@@ -80,9 +102,10 @@ defmodule Marrylocal.AccountsFixtures do
 
   def offset_user_token(token, amount_to_add, unit) do
     dt = DateTime.add(DateTime.utc_now(:second), amount_to_add, unit)
+    {:ok, hashed_token} = Accounts.UserToken.hash_session_token(token)
 
-    Marrylocal.Repo.update_all(
-      from(ut in Accounts.UserToken, where: ut.token == ^token),
+    Repo.update_all(
+      from(ut in Accounts.UserToken, where: ut.token == ^hashed_token),
       set: [inserted_at: dt, authenticated_at: dt]
     )
   end

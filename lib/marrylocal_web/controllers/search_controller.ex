@@ -18,15 +18,18 @@ defmodule MarrylocalWeb.SearchController do
         "economic_status" => params["economic_status"],
         # Convert "true"/"false" strings to actual booleans
         "job_status" => parse_bool(params["job_status"]),
-        "online_only" => parse_bool(params["online_only"]), # New param for filtering active users
+        # New param for filtering active users
+        "online_only" => parse_bool(params["online_only"]),
         # Use the logged-in user's stored coordinates
         "latitude" => user.latitude,
         "longitude" => user.longitude,
         "age_from" => parse_int(params["age_from"]),
         "age_to" => parse_int(params["age_to"]),
         "current_user_gender" => user.gender,
+        "current_user_id" => user.id,
         "distance" => parse_int(params["dist"]),
-        "current_user_shortlist" => user.shortlist || [] # Assuming shortlist is stored as an array of short IDs
+        # Assuming shortlist is stored as an array of short IDs
+        "current_user_shortlist" => user.shortlist || []
       }
 
       # 2. Run the dynamic query (now returns a Scrivener.Page struct)
@@ -45,6 +48,7 @@ defmodule MarrylocalWeb.SearchController do
 
   # Helper to handle empty or invalid numeric params from mobile/web
   defp parse_int(nil), do: nil
+
   defp parse_int(val) do
     case Integer.parse(val) do
       {num, _} -> num

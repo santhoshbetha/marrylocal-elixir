@@ -1,7 +1,8 @@
 defmodule Marrylocal.Workers.AnniversaryWarning do
   use Oban.Worker, queue: :mailers
   import Ecto.Query
-  alias Marrylocal.{Repo, Accounts.User, UserEmail, Mailer}
+  alias Marrylocal.{Repo, Accounts.User, Mailer}
+  alias Marrylocal.Emails.UserEmail
 
   @impl Oban.Worker
   def perform(_job) do
@@ -9,9 +10,10 @@ defmodule Marrylocal.Workers.AnniversaryWarning do
     warning_date = DateTime.utc_now() |> DateTime.add(-358, :day)
 
     # Find active users hitting their 358-day mark
-    query = from u in User,
-      where: u.date_of_activation <= ^warning_date,
-      where: u.user_state == :active
+    query =
+      from u in User,
+        where: u.date_of_activation <= ^warning_date,
+        where: u.user_state == :active
 
     Repo.all(query)
     |> Enum.each(fn user ->

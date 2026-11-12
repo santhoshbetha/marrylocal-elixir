@@ -1,27 +1,27 @@
 defmodule Marrylocal.RateLimit do
   use Hammer, backend: :ets
+
   @moduledoc """
-  A module to handle rate limiting using the Hammer library.
+  Hammer-backed rate limiting helpers.
   """
 
   @doc """
-  Checks if a given key has exceeded the specified limit within the time window.
-
-  ## Examples
-
-      iex> Marrylocal.RateLimit.check_rate("login_attempts:123", 5, 60_000)
-      {:ok, false} # Not rate limited
-
-      iex> Marrylocal.RateLimit.check_rate("login_attempts:123", 5, 60_000)
-      {:ok, true} # Rate limited
-
+  Increments the key and reports whether it is still inside the limit.
   """
   def check_rate(key, limit, time_window_ms) do
-    case Hammer.check_rate(key, time_window_ms, limit) do
-      {:ok, count} when count <= limit -> {:ok, false}
-      {:ok, _count} -> {:ok, true}
-      {:error, reason} -> {:error, reason}
+    case hit(key, time_window_ms, limit) do
+      {:allow, _count} -> {:ok, false}
+      {:deny, _retry_after} -> {:ok, true}
     end
   end
 
+  @doc """
+  Non-incrementing check used before a separate `hit/3`.
+  """
+  def check(key, limit, time_window_ms) do
+    case get(key, time_window_ms) do
+      count when count < limit -> {:allow, count}
+      _count -> {:deny, 0}
+    end
+  end
 end

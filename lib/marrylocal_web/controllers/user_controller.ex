@@ -100,18 +100,18 @@ defmodule MarrylocalWeb.UserController do
     render(conn, :index, users: users)
   end
 
-  #searching by email/phone is sensitive, you should protect this route.
+  # searching by email/phone is sensitive, you should protect this route.
   # In this example, we'll return the profile if found
   def find_by_contact(conn, %{"q" => identifier}) do
     case Accounts.get_user_by_contact(identifier) do
-      nil ->
+      {:ok, user} ->
+        # Returns the public profile data we defined earlier
+        render(conn, :show, user: user)
+
+      {:error, :not_found} ->
         conn
         |> put_status(:not_found)
         |> json(%{error: "No user found with that contact info"})
-
-      user ->
-        # Returns the public profile data we defined earlier
-        render(conn, :show, user: user)
     end
   end
 
@@ -197,7 +197,6 @@ defmodule MarrylocalWeb.UserController do
     end
   end
 
-
   def update_location(conn, %{"latitude" => lat, "longitude" => lng}) do
     user = conn.assigns.current_user
 
@@ -208,10 +207,13 @@ defmodule MarrylocalWeb.UserController do
       {:error, %Ecto.Changeset{} = changeset} ->
         # Check if the error is specifically about payment
         if Keyword.has_key?(changeset.errors, :latitude) &&
-          elem(changeset.errors[:latitude], 0) == "Payment is required to change your location" do
+             elem(changeset.errors[:latitude], 0) == "Payment is required to change your location" do
           conn
           |> put_status(:payment_required)
-          |> json(%{error: "payment_needed", message: "Please complete payment to change location."})
+          |> json(%{
+            error: "payment_needed",
+            message: "Please complete payment to change location."
+          })
         else
           conn
           |> put_status(:unprocessable_entity)
@@ -249,6 +251,7 @@ defmodule MarrylocalWeb.UserController do
       with_name: u2.first_name,
       with_shortid: u2.shortid
     })
+
     # Notify User 2
     MarrylocalWeb.Endpoint.broadcast("notifications:#{u2.id}", "mutual_match", %{
       with_name: u1.first_name,

@@ -7,10 +7,11 @@ defmodule Marrylocal.Repo.Migrations.CreateSubscriptions do
       add :user_id, references(:users, on_delete: :delete_all), null: false
 
       # JSONB field for flexible data storage
-      add :info, :map, default: "{}"
+      add :info, :map, default: %{}
 
       # Useful tracking fields
-      add :status, :string, default: "pending" # active, expired, canceled
+      # active, expired, canceled
+      add :status, :string, default: "pending"
       add :valid_until, :utc_datetime
 
       timestamps()

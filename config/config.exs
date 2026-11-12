@@ -7,6 +7,11 @@
 # General application configuration
 import Config
 
+# Exposed so controllers can decide whether to include diagnostic details in
+# error payloads. Production deployments keep internal exception messages out
+# of API responses while development and test keep them visible.
+config :marrylocal, :env, config_env()
+
 config :marrylocal, :scopes,
   user: [
     default: true,
@@ -24,16 +29,18 @@ config :marrylocal,
   ecto_repos: [Marrylocal.Repo],
   generators: [timestamp_type: :utc_datetime]
 
-config :ex_aws,
-  access_key_id: System.get_env("R2_ACCESS_KEY_ID"),
-  secret_access_key: System.get_env("R2_SECRET_ACCESS_KEY"),
-  region: "auto" # Cloudflare R2 uses "auto"
+# PostGIS geometry/geography types are decoded by a dedicated Postgrex
+# extension so `Geo.Point` structs round-trip through Ecto instead of leaking
+# raw WKB binaries into application code.
+config :geo_postgis, json_library: Jason
 
-config :ex_aws, :s3,
-  # Format: https://<account_id>.r2.cloudflarestorage.com
-  scheme: "https://",
-  host: System.get_env("R2_ENDPOINT_HOST"),
-  port: 443
+config :marrylocal, Marrylocal.Repo, types: Marrylocal.PostgresTypes
+
+# Runtime-owned account links. Production always overrides this through the
+# FRONTEND_URL environment variable in config/runtime.exs.
+config :marrylocal, Marrylocal.Accounts, frontend_url: "http://localhost:5173"
+
+config :marrylocal, :billing, default_annual_fee_inr: 500
 
 # Configures the endpoint
 config :marrylocal, MarrylocalWeb.Endpoint,
@@ -47,15 +54,23 @@ config :marrylocal, MarrylocalWeb.Endpoint,
 
 config :marrylocal, Oban,
   repo: Marrylocal.Repo,
+  queues: [default: 10, mailers: 5, invoices: 3],
   plugins: [
-    {Oban.Plugins.Cron, crontab: [
-      {"0 0 * * *", Marrylocal.Workers.UnverifiedUserCleanup}, # Runs every day at midnight
-      {"0 0 * * *", Marrylocal.Workers.YearlyReferralReset}, # Runs every year on January 1st
-      # Standard Cron: Minute Hour Day Month Day_of_Week
-      {"0 1 * * *", Marrylocal.Workers.InactivityTracker}
-    ]}
-  ],
-  queues: [default: 10]
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
+    {Oban.Plugins.Cron,
+     crontab: [
+       # Daily midnight maintenance
+       {"0 0 * * *", Marrylocal.Workers.UnverifiedUserCleanup},
+       {"0 0 * * *", Marrylocal.Workers.YearlyReferralReset},
+       # Daily inactivity sweep
+       {"0 1 * * *", Marrylocal.Workers.InactivityTracker},
+       # Daily 2 AM UTC check for 365-day fee resets
+       {"0 2 * * *", Marrylocal.Workers.YearlySubscriptionReset},
+       # Daily 3 AM UTC notification retention sweep
+       {"0 3 * * *", Marrylocal.Workers.NotificationCleanupWorker}
+     ]}
+  ]
 
 # Configures the mailer
 #
@@ -65,7 +80,8 @@ config :marrylocal, Oban,
 # For production it's recommended to configure a different adapter
 # at the `config/runtime.exs`.
 config :marrylocal, Marrylocal.Mailer,
-  adapter: Swoosh.Adapters.Local # Use Local for development
+  # Use Local for development
+  adapter: Swoosh.Adapters.Local
 
 # Configures Elixir's Logger
 config :logger, :default_formatter,

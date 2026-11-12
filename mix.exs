@@ -44,7 +44,9 @@ defmodule Marrylocal.MixProject do
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
+      {:geo_postgis, "~> 3.7"},
       {:swoosh, "~> 1.16"},
+      {:finch, "~> 0.18"},
       {:req, "~> 0.5"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
@@ -55,7 +57,12 @@ defmodule Marrylocal.MixProject do
       {:phoenix_html, "~> 4.0"},
       {:hammer, "~> 7.2"},
       {:scrivener_ecto, "~> 3.1"},
-      {:oban, "~> 2.17"}
+      {:oban, "~> 2.17"},
+      {:waffle, "~> 1.1"},
+      {:waffle_ecto, "~> 0.0.13"},
+      {:ex_aws, "~> 2.5"},
+      {:ex_aws_s3, "~> 2.5"},
+      {:sweet_xml, "~> 0.7"}
     ]
   end
 

@@ -5,6 +5,7 @@ defmodule Marrylocal.AccountsTest do
 
   import Marrylocal.AccountsFixtures
   alias Marrylocal.Accounts.{User, UserToken}
+  alias Marrylocal.Repo
 
   describe "get_user_by_email/1" do
     test "does not return the user if the email does not exist" do
@@ -77,13 +78,219 @@ defmodule Marrylocal.AccountsTest do
       assert "has already been taken" in errors_on(changeset).email
     end
 
-    test "registers users without password" do
+    test "registers users with a hashed password" do
       email = unique_user_email()
       {:ok, user} = Accounts.register_user(valid_user_attributes(email: email))
       assert user.email == email
-      assert is_nil(user.hashed_password)
+      assert is_binary(user.hashed_password)
       assert is_nil(user.confirmed_at)
       assert is_nil(user.password)
+    end
+
+    test "persists age only and discards the raw birthday" do
+      {:ok, user} =
+        Accounts.register_user(valid_user_attributes(date_of_birth: ~D[1995-01-01]))
+
+      assert is_integer(user.age)
+      assert user.age >= 18
+      assert is_nil(user.date_of_birth)
+    end
+
+    test "locks in the configured annual service fee at registration" do
+      previous = Application.get_env(:marrylocal, :billing)
+
+      on_exit(fn ->
+        if previous do
+          Application.put_env(:marrylocal, :billing, previous)
+        else
+          Application.delete_env(:marrylocal, :billing)
+        end
+      end)
+
+      Application.put_env(:marrylocal, :billing, default_annual_fee_inr: 750)
+
+      {:ok, user} = Accounts.register_user(valid_user_attributes())
+
+      assert user.accepted_one_time_fees_amount == 750
+    end
+
+    test "defaults the annual service fee to 500 when billing config is absent" do
+      previous = Application.get_env(:marrylocal, :billing)
+
+      on_exit(fn ->
+        if previous do
+          Application.put_env(:marrylocal, :billing, previous)
+        else
+          Application.delete_env(:marrylocal, :billing)
+        end
+      end)
+
+      Application.delete_env(:marrylocal, :billing)
+
+      {:ok, user} = Accounts.register_user(valid_user_attributes())
+
+      assert user.accepted_one_time_fees_amount == 500
+    end
+
+    test "generates an eight-character referral code" do
+      {:ok, user} = Accounts.register_user(valid_user_attributes())
+
+      assert user.referral_code =~ ~r/^ML[A-Z0-9]{6}$/
+      assert String.length(user.referral_code) == 8
+      assert user.referral_credits_count == 0
+    end
+
+    test "links a valid referral and credits the referrer atomically" do
+      referrer = user_fixture()
+
+      {:ok, referred} =
+        Accounts.register_user(valid_user_attributes(referred_by_code: referrer.referral_code))
+
+      assert referred.referred_by_id == referrer.id
+      assert Repo.get!(User, referrer.id).referral_credits_count == 1
+
+      summary = Accounts.referral_summary(referrer.id)
+
+      assert summary.referral_code == referrer.referral_code
+      assert summary.credit_value_inr == 50
+      assert [%{id: referred_id, credit_value_inr: 50}] = summary.referrals
+      assert referred_id == referred.id
+    end
+
+    test "rejects an unknown referral code" do
+      assert {:error, :invalid_referral_code} =
+               Accounts.register_user(valid_user_attributes(referred_by_code: "BADCODE1"))
+    end
+  end
+
+  describe "coordinate privacy" do
+    test "fuzzes persisted coordinates within the 5km bounding box" do
+      user = user_fixture()
+
+      assert {:ok, updated} =
+               Accounts.update_user_coordinates(user, %{
+                 latitude: 12.9716,
+                 longitude: 77.5946
+               })
+
+      assert_in_delta updated.latitude, 12.9716, 0.045
+      assert_in_delta updated.longitude, 77.5946, 0.045
+      refute updated.latitude == 12.9716 and updated.longitude == 77.5946
+      assert %Geo.Point{srid: 4326} = updated.location
+    end
+  end
+
+  describe "terms acceptance" do
+    test "persists the accepted flag through the profile changeset" do
+      user = user_fixture()
+
+      assert {:ok, updated} =
+               Accounts.update_profile_and_location(user, %{terms_accepted: true})
+
+      assert updated.terms_accepted == true
+    end
+  end
+
+  describe "one-time core profile edits" do
+    test "the first core edit sets the flag atomically" do
+      user = user_fixture()
+      refute user.core_details_edited
+
+      assert {:ok, updated} =
+               Accounts.update_profile_and_location(user, %{"first_name" => "Corrected"})
+
+      assert updated.first_name == "Corrected"
+      assert updated.core_details_edited
+    end
+
+    test "a second core edit is rejected once the flag is set" do
+      user = user_fixture()
+
+      assert {:ok, _updated} =
+               Accounts.update_profile_and_location(user, %{"community" => "Brahmin Iyer"})
+
+      user = Repo.get!(User, user.id)
+
+      assert {:error, :core_details_locked} =
+               Accounts.update_profile_and_location(user, %{"language" => "Tamil"})
+    end
+
+    test "education, job status, and religion remain editable after locking" do
+      user = user_fixture()
+
+      assert {:ok, _updated} =
+               Accounts.update_profile_and_location(user, %{"last_name" => "Corrected"})
+
+      user = Repo.get!(User, user.id)
+
+      assert {:ok, updated} =
+               Accounts.update_profile_and_location(user, %{
+                 "education_level" => "Masters level",
+                 "job_status" => true,
+                 "religion" => "Hindu"
+               })
+
+      assert updated.education_level == :"Masters level"
+      assert updated.job_status
+      assert updated.religion == "Hindu"
+      assert updated.core_details_edited
+    end
+
+    test "resubmitting unchanged core values does not consume the edit" do
+      user = user_fixture()
+
+      assert {:ok, unchanged} =
+               Accounts.update_profile_and_location(user, %{
+                 "first_name" => user.first_name,
+                 "last_name" => user.last_name
+               })
+
+      refute unchanged.core_details_edited
+
+      assert {:ok, updated} =
+               Accounts.update_profile_and_location(unchanged, %{"first_name" => "Corrected"})
+
+      assert updated.core_details_edited
+    end
+  end
+
+  describe "subscription activation" do
+    test "computes interval dates and structured feature columns on the server" do
+      user = user_fixture()
+      start_date = ~D[2026-11-10]
+
+      assert {:ok, %{user: updated, subscription: subscription}} =
+               Accounts.activate_subscription(
+                 user.id,
+                 %{
+                   "community_search" => true,
+                   "location2" => %{"city" => "Mumbai", "state" => "Maharashtra"}
+                 },
+                 start_date
+               )
+
+      assert subscription.status == "active"
+      assert subscription.info["start_date"] == "2026-11-10"
+      assert subscription.info["end_date"] == "2026-12-10"
+      assert updated.community_search_active == true
+      assert updated.multi_location_slots["location2"]["city"] == "Mumbai"
+    end
+
+    test "does not grant or retain the retired full-city addon entitlement" do
+      user =
+        user_fixture()
+        |> Ecto.Changeset.change(addons: %{"fullcitySearch" => true})
+        |> Repo.update!()
+
+      assert {:ok, %{user: updated}} =
+               Accounts.activate_subscription(
+                 user.id,
+                 %{"full_city_search" => true, "community_search" => true},
+                 ~D[2026-11-10]
+               )
+
+      refute Map.has_key?(updated.addons || %{}, "fullcitySearch")
+      assert updated.community_search_active == true
     end
   end
 
@@ -124,8 +331,8 @@ defmodule Marrylocal.AccountsTest do
           Accounts.deliver_user_update_email_instructions(user, "current@example.com", url)
         end)
 
-      {:ok, token} = Base.url_decode64(token, padding: false)
-      assert user_token = Repo.get_by(UserToken, token: :crypto.hash(:sha256, token))
+      {:ok, hashed_token} = UserToken.hash_session_token(token)
+      assert user_token = Repo.get_by(UserToken, token: hashed_token)
       assert user_token.user_id == user.id
       assert user_token.sent_to == user.email
       assert user_token.context == "change:current@example.com"
@@ -259,9 +466,11 @@ defmodule Marrylocal.AccountsTest do
 
     test "generates a token", %{user: user} do
       token = Accounts.generate_user_session_token(user)
-      assert user_token = Repo.get_by(UserToken, token: token)
+      {:ok, hashed_token} = UserToken.hash_session_token(token)
+      assert user_token = Repo.get_by(UserToken, token: hashed_token)
       assert user_token.context == "session"
       assert user_token.authenticated_at != nil
+      refute Repo.get_by(UserToken, token: token)
 
       # Creating the same token for another user should fail
       assert_raise Ecto.ConstraintError, fn ->
@@ -276,7 +485,8 @@ defmodule Marrylocal.AccountsTest do
     test "duplicates the authenticated_at of given user in new token", %{user: user} do
       user = %{user | authenticated_at: DateTime.add(DateTime.utc_now(:second), -3600)}
       token = Accounts.generate_user_session_token(user)
-      assert user_token = Repo.get_by(UserToken, token: token)
+      {:ok, hashed_token} = UserToken.hash_session_token(token)
+      assert user_token = Repo.get_by(UserToken, token: hashed_token)
       assert user_token.authenticated_at == user.authenticated_at
       assert DateTime.compare(user_token.inserted_at, user.authenticated_at) == :gt
     end
@@ -381,8 +591,8 @@ defmodule Marrylocal.AccountsTest do
           Accounts.deliver_login_instructions(user, url)
         end)
 
-      {:ok, token} = Base.url_decode64(token, padding: false)
-      assert user_token = Repo.get_by(UserToken, token: :crypto.hash(:sha256, token))
+      {:ok, hashed_token} = UserToken.hash_session_token(token)
+      assert user_token = Repo.get_by(UserToken, token: hashed_token)
       assert user_token.user_id == user.id
       assert user_token.sent_to == user.email
       assert user_token.context == "login"

@@ -1,24 +1,32 @@
 defmodule MarrylocalWeb.ApiAuth do
-  import Plug.Conn
-  alias Marrylocal.Accounts
+  @moduledoc """
+  Compatibility wrapper around the stateless API plugs in `MarrylocalWeb.UserAuth`.
 
-  # 1 day in seconds
-  @max_age 86_400
+  New routes should compose `fetch_current_user/2` and
+  `require_authenticated_api_user/2` in the router. This module remains for
+  older scopes that expect a single halting plug.
+  """
+
+  import Plug.Conn
+
+  alias MarrylocalWeb.UserAuth
 
   def init(opts), do: opts
 
+  @doc """
+  Fetches and enforces the bearer user. Halts with 401 when the token is
+  missing, malformed, expired, or revoked.
+  """
   def fetch_api_user(conn, _opts) do
-    with ["Bearer " <> token] <- get_req_header(conn, "authorization"),
-         {:ok, _user_id} <- Phoenix.Token.verify(conn, "user auth", token, max_age: @max_age),
-          # 2. Lookup user by the session token in DB
-         user when not is_nil(user) <- Accounts.get_user_by_session_token(token) do
-      assign(conn, :current_user, user)
+    conn = UserAuth.fetch_current_user(conn, [])
+
+    if conn.assigns[:current_user] do
+      conn
     else
-      _ ->
-        conn
-        |> put_status(:unauthorized)
-        |> Phoenix.Controller.json(%{error: "Invalid or expired token"})
-        |> halt()
+      conn
+      |> put_status(:unauthorized)
+      |> Phoenix.Controller.json(%{status: "error", message: "Invalid or expired token"})
+      |> halt()
     end
   end
 end

@@ -149,6 +149,32 @@ defmodule MarrylocalWeb.ProfilesController do
   end
 
   @doc """
+  PATCH /api/v1/profiles/me/location
+
+  Updates one location slot. Secondary slots require an active monthly addon
+  and each slot has an independent 30-day change cooldown.
+  """
+  def update_location(conn, params) do
+    user = conn.assigns.current_user
+    attrs = extract_location_params(params)
+    slot = params["slot"] || params["location_slot"] || "primary"
+
+    case Accounts.update_location_slot(user, slot, attrs) do
+      {:ok, updated} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          status: "success",
+          message: "Location updated",
+          data: %{profile: UserJSON.profile(updated)}
+        })
+
+      {:error, reason} ->
+        handle_error(conn, reason)
+    end
+  end
+
+  @doc """
   POST /api/v1/profiles/me/avatar
 
   Multipart upload shared by the primary avatar and the ten gallery slots.
@@ -170,12 +196,16 @@ defmodule MarrylocalWeb.ProfilesController do
     # browser would report as a CORS failure because the 500 has no headers).
     try do
       with {:ok, upload} <- extract_avatar_upload(params),
+           {:ok, photo_hash} <- ensure_unique_photo(user, upload),
            {:ok, destination} <- upload_destination(params) do
         case destination do
-          :avatar -> upload_primary_avatar(conn, user, upload)
-          {:slot, slot_index} -> upload_profile_photo(conn, user, upload, slot_index)
+          :avatar -> upload_primary_avatar(conn, user, upload, photo_hash)
+          {:slot, slot_index} -> upload_profile_photo(conn, user, upload, slot_index, photo_hash)
         end
       else
+        {:error, :duplicate_photo} ->
+          duplicate_photo_error(conn)
+
         {:error, :missing_avatar} ->
           missing_avatar_error(conn)
 
@@ -212,9 +242,11 @@ defmodule MarrylocalWeb.ProfilesController do
     end
   end
 
-  defp upload_primary_avatar(conn, user, upload) do
+  defp upload_primary_avatar(conn, user, upload, photo_hash) do
     case Accounts.update_avatar(user, %{avatar: upload}) do
       {:ok, updated} ->
+        if is_binary(photo_hash), do: Accounts.claim_photo_hash(updated, photo_hash, nil)
+
         conn
         |> put_status(:created)
         |> json(%{
@@ -237,14 +269,14 @@ defmodule MarrylocalWeb.ProfilesController do
     end
   end
 
-  defp upload_profile_photo(conn, user, upload, slot_index) do
+  defp upload_profile_photo(conn, user, upload, slot_index, photo_hash) do
     scope = %{user_id: user.id, slot_index: slot_index}
 
     case ProfilePhoto.store({upload, scope}) do
       {:ok, file_name} ->
         case ProfilePhoto.url({file_name, scope}) do
           image_url when is_binary(image_url) ->
-            persist_profile_photo(conn, user, image_url, slot_index)
+            persist_profile_photo(conn, user, image_url, slot_index, photo_hash)
 
           _other ->
             Logger.error(
@@ -266,9 +298,11 @@ defmodule MarrylocalWeb.ProfilesController do
     end
   end
 
-  defp persist_profile_photo(conn, user, image_url, slot_index) do
+  defp persist_profile_photo(conn, user, image_url, slot_index, photo_hash) do
     case Accounts.update_user_image_at_slot(user, image_url, slot_index) do
       {:ok, updated} ->
+        if is_binary(photo_hash), do: Accounts.claim_photo_hash(updated, photo_hash, slot_index)
+
         conn
         |> put_status(:created)
         |> json(%{
@@ -299,6 +333,8 @@ defmodule MarrylocalWeb.ProfilesController do
       {:ok, slot_index} ->
         case Accounts.clear_user_image_at_slot(user, slot_index) do
           {:ok, updated} ->
+            Accounts.release_photo_hash(updated, slot_index)
+
             conn
             |> put_status(:ok)
             |> json(%{
@@ -329,6 +365,8 @@ defmodule MarrylocalWeb.ProfilesController do
 
     case Accounts.clear_avatar(user) do
       {:ok, updated} ->
+        Accounts.release_photo_hash(updated, nil)
+
         conn
         |> put_status(:ok)
         |> json(%{
@@ -399,6 +437,31 @@ defmodule MarrylocalWeb.ProfilesController do
 
   defp extract_avatar_upload(%{"file" => %Plug.Upload{} = upload}), do: {:ok, upload}
   defp extract_avatar_upload(_params), do: {:error, :missing_avatar}
+
+  defp ensure_unique_photo(user, %Plug.Upload{} = upload) do
+    photo_hash = Accounts.profile_photo_hash(upload.path)
+
+    cond do
+      is_nil(photo_hash) or photo_hash == "" ->
+        {:ok, nil}
+
+      Accounts.photo_hash_claimed?(photo_hash, user.id) ->
+        {:error, :duplicate_photo}
+
+      true ->
+        {:ok, photo_hash}
+    end
+  end
+
+  defp duplicate_photo_error(conn) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      status: "error",
+      code: "duplicate_photo",
+      message: "This photo is already active on another profile."
+    })
+  end
 
   defp handle_avatar_changeset_error(conn, %Ecto.Changeset{} = changeset) do
     errors = Ecto.Changeset.traverse_errors(changeset, fn {msg, _opts} -> msg end)
@@ -668,13 +731,52 @@ defmodule MarrylocalWeb.ProfilesController do
     |> json(%{status: "error", message: "Profile not found"})
   end
 
+  defp handle_error(conn, :duplicate_location) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      message: "You already have this city assigned to another active location."
+    })
+  end
+
   defp handle_error(conn, :location_change_locked) do
     conn
     |> put_status(:unprocessable_entity)
     |> json(%{
       status: "error",
       code: "location_change_locked",
-      message: "Location can only be changed once every 30 days."
+      message: "This location can only be changed once every 30 days."
+    })
+  end
+
+  defp handle_error(conn, :location_addon_required) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      status: "error",
+      code: "LOCATION_ADDON_REQUIRED",
+      message: "This location addon is not active for your account."
+    })
+  end
+
+  defp handle_error(conn, :invalid_location_slot) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      code: "invalid_location_slot",
+      message: "Choose primary, location_2, or location_3."
+    })
+  end
+
+  defp handle_error(conn, :invalid_location) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      code: "invalid_location",
+      message: "A valid state, city, latitude, and longitude are required."
     })
   end
 
@@ -693,7 +795,16 @@ defmodule MarrylocalWeb.ProfilesController do
   defp extract_profile_params(%{"profile" => profile}) when is_map(profile), do: profile
 
   defp extract_profile_params(params) do
-    Map.drop(params, ["latitude", "longitude", "raw_lat", "raw_lon"])
+    Map.drop(params, ["latitude", "longitude", "raw_lat", "raw_lon", "slot", "location_slot"])
+  end
+
+  defp extract_location_params(params) do
+    %{
+      "state" => params["state"],
+      "city" => params["city"],
+      "latitude" => params["latitude"] || params["lat"],
+      "longitude" => params["longitude"] || params["lng"]
+    }
   end
 
   defp extract_coordinates(params) do

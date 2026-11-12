@@ -42,6 +42,8 @@ config :marrylocal, Marrylocal.Accounts, frontend_url: "http://localhost:5173"
 
 config :marrylocal, :billing, default_annual_fee_inr: 500
 
+config :marrylocal, :kyc, provider: "manual"
+
 # Configures the endpoint
 config :marrylocal, MarrylocalWeb.Endpoint,
   url: [host: "localhost"],
@@ -67,6 +69,8 @@ config :marrylocal, Oban,
        {"0 1 * * *", Marrylocal.Workers.InactivityTracker},
        # Daily 2 AM UTC check for 365-day fee resets
        {"0 2 * * *", Marrylocal.Workers.YearlySubscriptionReset},
+       # Daily 4 AM UTC sweep for expired monthly location addons
+       {"0 4 * * *", Marrylocal.Workers.SubscriptionExpiryWorker},
        # Daily 3 AM UTC notification retention sweep
        {"0 3 * * *", Marrylocal.Workers.NotificationCleanupWorker}
      ]}

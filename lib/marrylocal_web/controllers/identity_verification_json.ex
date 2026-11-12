@@ -29,8 +29,11 @@ defmodule MarrylocalWeb.IdentityVerificationJSON do
   defp document_url(%{document_image: nil}), do: nil
   defp document_url(%{document_image: ""}), do: nil
 
-  defp document_url(%{document_image: image} = verification) do
-    VerificationDocument.url({image, verification})
+  defp document_url(%{document_image: image}) do
+    case VerificationDocument.presigned_url(image) do
+      {:ok, url} -> url
+      _ -> nil
+    end
   rescue
     _ -> nil
   end

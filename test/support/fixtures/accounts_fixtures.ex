@@ -15,11 +15,11 @@ defmodule Marrylocal.AccountsFixtures do
 
   def valid_user_attributes(attrs \\ %{}) do
     suffix = System.unique_integer([:positive])
-    phone_suffix = rem(suffix, 1_000_000_000)
 
     Enum.into(attrs, %{
       email: unique_user_email(),
-      phone_number: "+9198#{phone_suffix}",
+      phone_number:
+        "9#{String.pad_leading(Integer.to_string(rem(suffix, 1_000_000_000)), 9, "0")}",
       date_of_birth: ~D[1995-01-01],
       first_name: "Test",
       last_name: "User",

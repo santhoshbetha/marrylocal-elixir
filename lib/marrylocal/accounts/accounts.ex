@@ -11,6 +11,8 @@ defmodule Marrylocal.Accounts do
   alias Marrylocal.Mailer
 
   alias Marrylocal.Accounts.{User, UserToken, UserNotifier, Subscription}
+  alias Marrylocal.Accounts.UserPhotoHash
+  alias Marrylocal.Billing
   alias Marrylocal.Features
   alias Marrylocal.Geo
   alias Marrylocal.DeletedUsers.DeletedUser
@@ -485,43 +487,215 @@ defmodule Marrylocal.Accounts do
         {:error, :user_not_found}
 
       %User{} = user ->
-        end_date = Date.add(start_date, 30)
-        valid_until = DateTime.new!(end_date, ~T[23:59:59], "Etc/UTC")
-        community_active = items["community_search"] == true || user.community_search_active
-        slots = merge_location_slots(user.multi_location_slots || %{}, items)
-        addons = merge_legacy_addons(user.addons || %{}, items, community_active)
+        with :ok <- validate_addon_locations(user, items) do
+          end_date = Date.add(start_date, 30)
+          valid_until = DateTime.new!(end_date, ~T[23:59:59], "Etc/UTC")
+          purchased_at = DateTime.utc_now() |> DateTime.truncate(:second)
+          community_active = items["community_search"] == true || user.community_search_active
+          slots = merge_location_slots(user.multi_location_slots || %{}, items)
+          addons = merge_legacy_addons(user.addons || %{}, items, community_active)
+          location_attrs = location_entitlement_attrs(user, items, purchased_at)
+          expires_2 = location_attrs[:location_2_expires_at]
+          expires_3 = location_attrs[:location_3_expires_at]
 
-        Repo.transaction(fn ->
-          {:ok, updated_user} =
-            user
-            |> Ecto.Changeset.change(%{
-              community_search_active: community_active,
-              multi_location_slots: slots,
-              addons: addons
-            })
-            |> Repo.update()
+          Repo.transaction(fn ->
+            {:ok, updated_user} =
+              user
+              |> Ecto.Changeset.change(
+                Map.merge(
+                  %{
+                    community_search_active: community_active,
+                    multi_location_slots: slots,
+                    addons: addons
+                  },
+                  location_attrs
+                )
+              )
+              |> Repo.update()
 
-          subscription =
-            Repo.get_by(Subscription, user_id: user.id) ||
-              %Subscription{user_id: user.id}
+            subscription =
+              Repo.get_by(Subscription, user_id: user.id) ||
+                %Subscription{user_id: user.id}
 
-          {:ok, subscription} =
-            subscription
-            |> Subscription.changeset(%{
-              status: "active",
-              valid_until: valid_until,
-              info: %{
-                "start_date" => Date.to_iso8601(start_date),
-                "end_date" => Date.to_iso8601(end_date),
-                "items" => items
-              }
-            })
-            |> Repo.insert_or_update()
+            {:ok, subscription} =
+              subscription
+              |> Subscription.changeset(%{
+                status: "active",
+                valid_until: valid_until,
+                info: %{
+                  "start_date" => Date.to_iso8601(start_date),
+                  "end_date" => Date.to_iso8601(end_date),
+                  "items" => items
+                }
+              })
+              |> Repo.insert_or_update()
 
-          %{user: updated_user, subscription: subscription}
-        end)
+            maybe_insert_addon_invoice(
+              user,
+              "community_search",
+              items["community_search"],
+              purchased_at,
+              valid_until
+            )
+
+            maybe_insert_addon_invoice(
+              user,
+              "location2",
+              items["location2"],
+              purchased_at,
+              expires_2
+            )
+
+            maybe_insert_addon_invoice(
+              user,
+              "location3",
+              items["location3"],
+              purchased_at,
+              expires_3
+            )
+
+            %{user: updated_user, subscription: subscription}
+          end)
+        end
     end
   end
+
+  @doc "Rejects addon purchases that would duplicate an active location pair."
+  def validate_addon_locations(%User{} = user, items) when is_map(items) do
+    location_2 = items["location2"]
+    location_3 = items["location3"]
+
+    cond do
+      duplicate_location?(user, :location_2, location_2) ->
+        {:error, :duplicate_location}
+
+      duplicate_location?(user, :location_3, location_3) ->
+        {:error, :duplicate_location}
+
+      duplicate_location_pair?(location_2, location_3) ->
+        {:error, :duplicate_location}
+
+      true ->
+        :ok
+    end
+  end
+
+  def validate_addon_locations(_user, _items), do: :ok
+
+  @doc "True when a slot update would duplicate another active location pair."
+  def duplicate_location?(%User{} = user, slot, %{"state" => state, "city" => city}) do
+    duplicate_location?(user, slot, state, city)
+  end
+
+  def duplicate_location?(_user, _slot, _attrs), do: false
+
+  def duplicate_location?(%User{} = user, slot, state, city) do
+    target = normalize_location_pair(state, city)
+
+    target != nil and
+      Enum.any?(other_active_location_pairs(user, slot), fn {_slot, other_state, other_city} ->
+        normalize_location_pair(other_state, other_city) == target
+      end)
+  end
+
+  def duplicate_location?(_user, _slot, _state, _city), do: false
+
+  defp duplicate_location_pair?(left, right) do
+    normalize_location_pair(location_value(left, "state"), location_value(left, "city")) != nil and
+      normalize_location_pair(location_value(left, "state"), location_value(left, "city")) ==
+        normalize_location_pair(location_value(right, "state"), location_value(right, "city"))
+  end
+
+  defp location_value(%{} = location, key), do: location[key]
+  defp location_value(_location, _key), do: nil
+
+  defp other_active_location_pairs(user, exclude_slot) do
+    []
+    |> maybe_add_primary_pair(user, exclude_slot)
+    |> maybe_add_secondary_pair(user, :location_2, exclude_slot)
+    |> maybe_add_secondary_pair(user, :location_3, exclude_slot)
+  end
+
+  defp maybe_add_primary_pair(pairs, user, exclude_slot) do
+    if exclude_slot != :primary and present_location_pair?(user.state, user.city) do
+      [{:primary, user.state, user.city} | pairs]
+    else
+      pairs
+    end
+  end
+
+  defp maybe_add_secondary_pair(pairs, user, slot, exclude_slot) do
+    {state, city} = secondary_location_pair(user, slot)
+
+    if slot != exclude_slot and User.location_active?(user, slot) and
+         present_location_pair?(state, city) do
+      [{slot, state, city} | pairs]
+    else
+      pairs
+    end
+  end
+
+  defp secondary_location_pair(user, :location_2),
+    do: {user.location_2_state, user.location_2_city}
+
+  defp secondary_location_pair(user, :location_3),
+    do: {user.location_3_state, user.location_3_city}
+
+  defp present_location_pair?(state, city), do: is_binary(state) and is_binary(city)
+
+  defp normalize_location_pair(state, city) do
+    normalized_state = state |> to_string() |> String.trim() |> String.downcase()
+    normalized_city = city |> to_string() |> String.trim() |> String.downcase()
+
+    if normalized_state != "" and normalized_city != "" do
+      {normalized_state, normalized_city}
+    end
+  end
+
+  defp maybe_insert_addon_invoice(_user, _key, nil, _period_start, _period_end), do: :ok
+  defp maybe_insert_addon_invoice(_user, _key, false, _period_start, _period_end), do: :ok
+
+  defp maybe_insert_addon_invoice(user, key, _selected, period_start, period_end) do
+    case Billing.create_itemized_invoice(user, key,
+           period_start: period_start,
+           period_end: period_end,
+           payment_reference: "subscription-#{user.id}-#{System.system_time(:second)}"
+         ) do
+      {:ok, _invoice} -> :ok
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp location_entitlement_attrs(user, items, purchased_at) do
+    attrs =
+      %{}
+      |> put_location_entitlement(user, :location_2, items["location2"], purchased_at)
+      |> put_location_entitlement(user, :location_3, items["location3"], purchased_at)
+
+    attrs
+  end
+
+  defp put_location_entitlement(attrs, user, slot, %{"city" => city, "state" => state}, now)
+       when is_binary(city) and is_binary(state) and city != "" and state != "" do
+    prefix = Atom.to_string(slot)
+    current_expiry = Map.get(user, String.to_existing_atom("#{prefix}_expires_at"))
+    base = latest_datetime(now, current_expiry)
+
+    Map.merge(attrs, %{
+      String.to_existing_atom("#{prefix}_city") => city,
+      String.to_existing_atom("#{prefix}_state") => state,
+      String.to_existing_atom("#{prefix}_purchased_at") => now,
+      String.to_existing_atom("#{prefix}_expires_at") => DateTime.add(base, 30, :day)
+    })
+  end
+
+  defp put_location_entitlement(attrs, _user, _slot, _value, _now), do: attrs
+
+  defp latest_datetime(now, %DateTime{} = existing) do
+    if DateTime.compare(existing, now) == :gt, do: existing, else: now
+  end
+
+  defp latest_datetime(now, _existing), do: now
 
   defp merge_location_slots(slots, items) do
     slots
@@ -1066,6 +1240,74 @@ defmodule Marrylocal.Accounts do
 
   def clear_user_image_at_slot(_user, _slot_index), do: {:error, :invalid_slot_index}
 
+  @doc "SHA-256 fingerprint for an uploaded profile image."
+  def profile_photo_hash(path) when is_binary(path) do
+    if File.exists?(path) do
+      path
+      |> File.read!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+    end
+  end
+
+  def profile_photo_hash(_path), do: nil
+
+  @doc "True when another user already has this exact photo active."
+  def photo_hash_claimed?(photo_hash, user_id) do
+    from(h in UserPhotoHash,
+      where: h.photo_hash == ^photo_hash and h.active == true and h.user_id != ^user_id,
+      select: count(h.id)
+    )
+    |> Repo.one()
+    |> Kernel.>(0)
+  end
+
+  @doc "Claims a photo fingerprint for one user and slot."
+  def claim_photo_hash(%User{} = user, photo_hash, slot_index) do
+    slot_index = normalize_photo_slot(slot_index)
+
+    Repo.transaction(fn ->
+      existing = Repo.get_by(UserPhotoHash, photo_hash: photo_hash, active: true)
+
+      cond do
+        existing && existing.user_id != user.id ->
+          Repo.rollback(:duplicate_photo)
+
+        true ->
+          Repo.delete_all(
+            from(h in UserPhotoHash,
+              where: h.user_id == ^user.id and h.slot_index == ^slot_index
+            )
+          )
+
+          %UserPhotoHash{}
+          |> UserPhotoHash.changeset(%{
+            user_id: user.id,
+            photo_hash: photo_hash,
+            slot_index: slot_index,
+            active: true
+          })
+          |> Repo.insert()
+      end
+    end)
+  end
+
+  @doc "Releases the fingerprint for a replaced or deleted photo slot."
+  def release_photo_hash(%User{} = user, slot_index) do
+    slot_index = normalize_photo_slot(slot_index)
+
+    from(h in UserPhotoHash,
+      where: h.user_id == ^user.id and h.slot_index == ^slot_index
+    )
+    |> Repo.delete_all()
+
+    :ok
+  end
+
+  defp normalize_photo_slot(nil), do: -1
+  defp normalize_photo_slot(value) when is_integer(value), do: value
+  defp normalize_photo_slot(_value), do: -1
+
   defp pad_images_to_slot(images, slot_index) do
     missing = slot_index + 1 - length(images)
     if missing > 0, do: images ++ List.duplicate(nil, missing), else: images
@@ -1234,6 +1476,111 @@ defmodule Marrylocal.Accounts do
       end
     end
   end
+
+  @doc "Updates the primary or a purchased secondary location with its own cooldown."
+  def update_location_slot(%User{} = user, slot, attrs) when is_map(attrs) do
+    normalized_slot = normalize_location_slot(slot)
+
+    if normalized_slot in [:primary, :location_2, :location_3] and
+         duplicate_location?(user, normalized_slot, attrs["state"], attrs["city"]) do
+      {:error, :duplicate_location}
+    else
+      case normalized_slot do
+        :primary ->
+          update_profile_and_location(
+            user,
+            %{"state" => attrs["state"], "city" => attrs["city"]},
+            %{
+              "latitude" => attrs["latitude"] || attrs["lat"],
+              "longitude" => attrs["longitude"] || attrs["lng"]
+            }
+          )
+
+        slot when slot in [:location_2, :location_3] ->
+          update_secondary_location(user, slot, attrs)
+
+        _ ->
+          {:error, :invalid_location_slot}
+      end
+    end
+  end
+
+  def update_location_slot(_user, _slot, _attrs), do: {:error, :invalid_location_slot}
+
+  defp update_secondary_location(user, slot, attrs) do
+    cond do
+      not User.location_active?(user, slot) ->
+        {:error, :location_addon_required}
+
+      secondary_location_locked?(user, slot) ->
+        {:error, :location_change_locked}
+
+      not valid_location_attrs?(attrs) ->
+        {:error, :invalid_location}
+
+      true ->
+        {fuzzed_lat, fuzzed_lng} =
+          Geo.fuzz_coordinates(
+            parse_coordinate(attrs["latitude"] || attrs["lat"]),
+            parse_coordinate(attrs["longitude"] || attrs["lng"])
+          )
+
+        prefix = Atom.to_string(slot)
+
+        changes = %{
+          String.to_existing_atom("#{prefix}_state") => attrs["state"],
+          String.to_existing_atom("#{prefix}_city") => attrs["city"],
+          String.to_existing_atom("#{prefix}_geom") => Geo.point(fuzzed_lat, fuzzed_lng),
+          String.to_existing_atom("#{prefix}_last_changed_at") =>
+            DateTime.utc_now() |> DateTime.truncate(:second)
+        }
+
+        user
+        |> Ecto.Changeset.change(changes)
+        |> Repo.update()
+        |> case do
+          {:ok, updated} -> evaluate_gating(updated)
+          error -> error
+        end
+    end
+  end
+
+  defp secondary_location_locked?(user, slot) do
+    case User.location_last_changed_at(user, slot) do
+      %DateTime{} = changed_at ->
+        DateTime.compare(DateTime.add(changed_at, 30, :day), DateTime.utc_now()) == :gt
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_location_attrs?(attrs) do
+    present_string?(attrs["state"]) and present_string?(attrs["city"]) and
+      is_number(parse_coordinate(attrs["latitude"] || attrs["lat"])) and
+      is_number(parse_coordinate(attrs["longitude"] || attrs["lng"]))
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp parse_coordinate(value) when is_number(value), do: value * 1.0
+
+  defp parse_coordinate(value) when is_binary(value) do
+    case Float.parse(value) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp parse_coordinate(_value), do: nil
+
+  defp normalize_location_slot("primary"), do: :primary
+  defp normalize_location_slot("location_1"), do: :primary
+  defp normalize_location_slot("location_2"), do: :location_2
+  defp normalize_location_slot(:location_2), do: :location_2
+  defp normalize_location_slot("location_3"), do: :location_3
+  defp normalize_location_slot(:location_3), do: :location_3
+  defp normalize_location_slot(_slot), do: :invalid
 
   defp maybe_update_coords(user, nil), do: {:ok, user}
 

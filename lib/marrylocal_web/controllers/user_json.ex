@@ -7,6 +7,7 @@ defmodule MarrylocalWeb.UserJSON do
   Distance is attached by the discovery context as a rounded kilometre value.
   """
 
+  alias Marrylocal.Accounts.User
   alias Marrylocal.Uploaders.Avatar
   alias Marrylocal.Features
 
@@ -32,6 +33,7 @@ defmodule MarrylocalWeb.UserJSON do
       effective_payment_required: Features.payment_enforcement_active?(user),
       onboarding_complete: onboarding_complete?(user)
     }
+    |> Map.merge(location_switcher_fields(user))
   end
 
   def profile(user) do
@@ -54,7 +56,7 @@ defmodule MarrylocalWeb.UserJSON do
       is_beta_tester: user.is_beta_tester,
       community_search_enabled: Features.community_search_enabled?(user),
       community_search_active: user.community_search_active,
-      multi_location_slots: user.multi_location_slots,
+      multi_location_slots: legacy_location_slots(user),
       max_search_distance: user.max_search_distance,
       latitude: user.latitude,
       longitude: user.longitude,
@@ -89,6 +91,8 @@ defmodule MarrylocalWeb.UserJSON do
         "show_community" => user.show_community
       }
     })
+    |> Map.merge(location_switcher_fields(user))
+    |> Map.merge(location_slot_fields(user))
   end
 
   def public_profile(user) do
@@ -155,6 +159,108 @@ defmodule MarrylocalWeb.UserJSON do
       phone: if(user.show_phone, do: user.phone_number, else: nil)
     }
   end
+
+  defp location_switcher_fields(user) do
+    %{
+      location_2_active: User.location_active?(user, :location_2),
+      location_2_city: user.location_2_city,
+      location_2_state: user.location_2_state,
+      location_2_expires_at: user.location_2_expires_at,
+      location_3_active: User.location_active?(user, :location_3),
+      location_3_city: user.location_3_city,
+      location_3_state: user.location_3_state,
+      location_3_expires_at: user.location_3_expires_at
+    }
+  end
+
+  defp location_slot_fields(user) do
+    slot2 = secondary_slot_json(user, :location_2, "location_2")
+    slot3 = secondary_slot_json(user, :location_3, "location_3")
+
+    Map.merge(location_switcher_fields(user), %{
+      location_2_latitude: slot2.latitude,
+      location_2_longitude: slot2.longitude,
+      location_2_last_changed_at: slot2.last_changed_at,
+      location_2_allow_change_at: slot2.allow_change_at,
+      location_2_change_locked: slot2.change_locked,
+      location_3_latitude: slot3.latitude,
+      location_3_longitude: slot3.longitude,
+      location_3_last_changed_at: slot3.last_changed_at,
+      location_3_allow_change_at: slot3.allow_change_at,
+      location_3_change_locked: slot3.change_locked,
+      location_slots: %{
+        primary: %{
+          slot: "primary",
+          label: "Primary Location",
+          active: true,
+          city: user.city,
+          state: user.state,
+          latitude: user.latitude,
+          longitude: user.longitude
+        },
+        location_2: slot2,
+        location_3: slot3
+      }
+    })
+  end
+
+  defp secondary_slot_json(user, slot, key) do
+    geom = Map.get(user, String.to_existing_atom("#{key}_geom"))
+    {latitude, longitude} = geom_coords(geom)
+    last_changed = Map.get(user, String.to_existing_atom("#{key}_last_changed_at"))
+    allow_change_at = last_changed && DateTime.add(last_changed, 30, :day)
+
+    %{
+      slot: key,
+      label: if(slot == :location_2, do: "Location 2", else: "Location 3"),
+      active: User.location_active?(user, slot),
+      city: Map.get(user, String.to_existing_atom("#{key}_city")),
+      state: Map.get(user, String.to_existing_atom("#{key}_state")),
+      latitude: latitude,
+      longitude: longitude,
+      purchased_at: Map.get(user, String.to_existing_atom("#{key}_purchased_at")),
+      expires_at: Map.get(user, String.to_existing_atom("#{key}_expires_at")),
+      last_changed_at: last_changed,
+      allow_change_at: allow_change_at,
+      change_locked:
+        allow_change_at != nil and DateTime.compare(allow_change_at, DateTime.utc_now()) == :gt
+    }
+  end
+
+  defp legacy_location_slots(user) do
+    %{}
+    |> put_legacy_slot(
+      "location2",
+      user.location_2_city,
+      user.location_2_state,
+      user.location_2_geom
+    )
+    |> put_legacy_slot(
+      "location3",
+      user.location_3_city,
+      user.location_3_state,
+      user.location_3_geom
+    )
+  end
+
+  defp put_legacy_slot(slots, _key, nil, _state, _geom), do: slots
+
+  defp put_legacy_slot(slots, key, city, state, geom) do
+    {latitude, longitude} = geom_coords(geom)
+
+    Map.put(slots, key, %{
+      "city" => city,
+      "state" => state,
+      "lat" => latitude,
+      "lng" => longitude
+    })
+  end
+
+  defp geom_coords(%Geo.Point{coordinates: {longitude, latitude}}) do
+    {Float.round(latitude * 1.0, 6), Float.round(longitude * 1.0, 6)}
+  end
+
+  defp geom_coords(_geom), do: {nil, nil}
 
   defp location_change_allowed_at(%{date_of_location: nil}), do: nil
 

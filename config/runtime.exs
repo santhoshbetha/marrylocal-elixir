@@ -61,6 +61,10 @@ config :marrylocal, Marrylocal.Accounts,
 config :marrylocal, :billing,
   default_annual_fee_inr: String.to_integer(System.get_env("DEFAULT_ANNUAL_FEE_INR") || "500")
 
+config :marrylocal, :kyc,
+  provider: System.get_env("KYC_PROVIDER", "manual"),
+  identity_salt: System.get_env("KYC_IDENTITY_SALT", "marrylocal-manual-kyc-v1")
+
 # Cloudflare R2 is S3-compatible. Values are read at runtime so dev/test can
 # run without production credentials, while deployments override the account
 # endpoint, bucket, and public asset host through the environment.

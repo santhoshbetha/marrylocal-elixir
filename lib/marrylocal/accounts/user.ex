@@ -3,6 +3,8 @@ defmodule Marrylocal.Accounts.User do
   use Waffle.Ecto.Schema
   import Ecto.Changeset
 
+  alias Marrylocal.Accounts.SignupGuard
+
   @admin_update_fields [
     :email_verified,
     :aadhar_verified,
@@ -104,6 +106,18 @@ defmodule Marrylocal.Accounts.User do
     field :is_beta_tester, :boolean, default: false
     field :community_search_active, :boolean, default: false
     field :multi_location_slots, :map, default: %{}
+    field :location_2_state, :string
+    field :location_2_city, :string
+    field :location_2_geom, Geo.PostGIS.Geometry
+    field :location_2_last_changed_at, :utc_datetime
+    field :location_2_purchased_at, :utc_datetime
+    field :location_2_expires_at, :utc_datetime
+    field :location_3_state, :string
+    field :location_3_city, :string
+    field :location_3_geom, Geo.PostGIS.Geometry
+    field :location_3_last_changed_at, :utc_datetime
+    field :location_3_purchased_at, :utc_datetime
+    field :location_3_expires_at, :utc_datetime
     field :email_verified, :boolean, default: false
     field :aadhar_verified, :boolean, default: false
     field :passport_verified, :boolean, default: false
@@ -270,6 +284,27 @@ defmodule Marrylocal.Accounts.User do
 
   defp normalize_birth_date_attrs(attrs), do: attrs
 
+  defp normalize_registration_attrs(attrs) when is_map(attrs) do
+    attrs = normalize_birth_date_attrs(attrs)
+
+    case attrs["phone_number"] do
+      nil -> attrs
+      phone -> Map.put(attrs, "phone_number", SignupGuard.normalize_phone(phone))
+    end
+  end
+
+  defp normalize_registration_attrs(attrs), do: attrs
+
+  defp validate_non_disposable_email(changeset) do
+    email = get_field(changeset, :email)
+
+    if SignupGuard.disposable_email?(email) do
+      add_error(changeset, :email, "temporary email domains are not allowed")
+    else
+      changeset
+    end
+  end
+
   defp calculate_age(dob) do
     today = Date.utc_today()
     age = today.year - dob.year
@@ -339,7 +374,7 @@ defmodule Marrylocal.Accounts.User do
   end
 
   def registration_changeset(user, attrs, opts \\ []) do
-    attrs = normalize_birth_date_attrs(attrs)
+    attrs = normalize_registration_attrs(attrs)
 
     user
     |> cast(attrs, [
@@ -364,6 +399,11 @@ defmodule Marrylocal.Accounts.User do
     ])
     |> validate_required([:email, :phone_number, :first_name, :password])
     |> validate_email([])
+    |> validate_non_disposable_email()
+    |> unique_constraint(:phone_number)
+    |> validate_format(:phone_number, ~r/^\d{10}$/,
+      message: "must be a valid 10-digit Indian mobile number"
+    )
     |> validate_password(opts)
     |> validate_confirmation(:password, message: "does not match password")
     |> validate_handle()
@@ -401,7 +441,7 @@ defmodule Marrylocal.Accounts.User do
   end
 
   def admin_registration_changeset(user, attrs) do
-    attrs = normalize_birth_date_attrs(attrs)
+    attrs = normalize_registration_attrs(attrs)
 
     user
     |> cast(attrs, [
@@ -430,6 +470,7 @@ defmodule Marrylocal.Accounts.User do
     |> validate_format(:email, ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/,
       message: "must be a valid email address"
     )
+    |> validate_non_disposable_email()
     |> validate_format(:phone_number, ~r/^\d{10}$/, message: "must be exactly 10 digits")
     |> validate_confirmation(:password, message: "does not match password")
     |> validate_invite_code()
@@ -649,6 +690,29 @@ defmodule Marrylocal.Accounts.User do
     |> put_change(:user_coordinates_set, true)
     |> put_change(:default_coordinates_set, false)
   end
+
+  @doc "Returns true when a purchased location addon has not expired."
+  def location_active?(%__MODULE__{} = user, slot) do
+    case location_expiry(user, slot) do
+      %DateTime{} = expires_at ->
+        DateTime.compare(expires_at, DateTime.utc_now()) == :gt
+
+      _ ->
+        false
+    end
+  end
+
+  def location_expiry(user, "location_2"), do: user.location_2_expires_at
+  def location_expiry(user, :location_2), do: user.location_2_expires_at
+  def location_expiry(user, "location_3"), do: user.location_3_expires_at
+  def location_expiry(user, :location_3), do: user.location_3_expires_at
+  def location_expiry(_user, _slot), do: nil
+
+  def location_last_changed_at(user, "location_2"), do: user.location_2_last_changed_at
+  def location_last_changed_at(user, :location_2), do: user.location_2_last_changed_at
+  def location_last_changed_at(user, "location_3"), do: user.location_3_last_changed_at
+  def location_last_changed_at(user, :location_3), do: user.location_3_last_changed_at
+  def location_last_changed_at(_user, _slot), do: nil
 
   # Fuzz before Ecto validates or writes the PostGIS point. The raw client
   # latitude/longitude never reaches PostgreSQL.

@@ -11,11 +11,13 @@ defmodule Marrylocal.Accounts.Verifications do
   require Logger
 
   alias Marrylocal.Accounts.IdentityVerification
+  alias Marrylocal.Accounts.SignupGuard
   alias Marrylocal.Accounts.User
   alias Marrylocal.Accounts.VerificationProcessor
   alias Marrylocal.Notifications
   alias Marrylocal.Repo
   alias Marrylocal.Uploaders.VerificationDocument
+  alias Marrylocal.Workers.DuplicateAccountPurgeWorker
 
   @pending_status "pending_admin_review"
 
@@ -23,18 +25,30 @@ defmodule Marrylocal.Accounts.Verifications do
   Creates or replaces the user's verification submission inside one transaction.
   """
   def submit(%User{} = user, attrs) do
+    attrs = normalize_submission_attrs(attrs)
+    identity_hash = SignupGuard.identity_hash(attrs["document_type"], attrs["document_number"])
+
     Repo.transaction(fn ->
       existing = Repo.get_by(IdentityVerification, user_id: user.id)
+      claimed = Repo.get_by(IdentityVerification, identity_hash: identity_hash)
 
       cond do
         existing && existing.status == "verified" ->
           Repo.rollback(:already_verified)
 
+        claimed && claimed.user_id != user.id ->
+          Repo.rollback(:duplicate_identity)
+
         true ->
           verification = existing || %IdentityVerification{user_id: user.id}
 
           verification
-          |> IdentityVerification.changeset(attrs)
+          |> IdentityVerification.changeset(
+            Map.merge(attrs, %{
+              "identity_hash" => identity_hash,
+              "status" => @pending_status
+            })
+          )
           |> Repo.insert_or_update()
           |> case do
             {:ok, saved} ->
@@ -47,6 +61,17 @@ defmodule Marrylocal.Accounts.Verifications do
               Repo.rollback(changeset)
           end
       end
+    end)
+  end
+
+  defp normalize_submission_attrs(attrs) do
+    attrs
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+    |> Map.update("document_type", nil, fn value ->
+      value && value |> to_string() |> String.trim() |> String.downcase()
+    end)
+    |> Map.update("document_number", nil, fn value ->
+      value && SignupGuard.normalize_document_number(value)
     end)
   end
 
@@ -64,6 +89,16 @@ defmodule Marrylocal.Accounts.Verifications do
   def get(id) do
     IdentityVerification
     |> Repo.get(id)
+    |> case do
+      nil -> nil
+      verification -> Repo.preload(verification, :user)
+    end
+  end
+
+  @doc "Fetches the current user's verification submission, if any."
+  def get_for_user(user_id) do
+    IdentityVerification
+    |> Repo.get_by(user_id: user_id)
     |> case do
       nil -> nil
       verification -> Repo.preload(verification, :user)
@@ -92,12 +127,19 @@ defmodule Marrylocal.Accounts.Verifications do
     case result do
       {:ok, {updated, notification}} ->
         purge_document(verification)
+        enqueue_duplicate_purge(updated.user_id)
         Notifications.broadcast_many([notification])
         {:ok, Repo.preload(updated, :user, force: true)}
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp enqueue_duplicate_purge(user_id) do
+    %{user_id: user_id}
+    |> DuplicateAccountPurgeWorker.new()
+    |> Oban.insert()
   end
 
   @doc """

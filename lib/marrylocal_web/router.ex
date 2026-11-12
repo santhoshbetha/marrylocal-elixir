@@ -36,6 +36,10 @@ defmodule MarrylocalWeb.Router do
     plug MarrylocalWeb.Plugs.RateLimitDiscovery
   end
 
+  pipeline :rate_limit_registration do
+    plug MarrylocalWeb.Plugs.RateLimitRegistration
+  end
+
   pipeline :admin_required do
     plug :accepts, ["json"]
     plug :fetch_current_user
@@ -96,11 +100,17 @@ defmodule MarrylocalWeb.Router do
   # Public authentication handshake
   # ---------------------------------------------------------------------------
   scope "/api", MarrylocalWeb do
+    pipe_through [:api_public, :rate_limit_registration]
+
+    post "/v1/auth/register", RegistrationController, :create
+    post "/users/register", RegistrationController, :create
+  end
+
+  scope "/api", MarrylocalWeb do
     pipe_through :api_public
 
     # Versioned native API. Tokens are opaque and database-backed; no JWT
     # signature is trusted on its own.
-    post "/v1/auth/register", RegistrationController, :create
     post "/v1/auth/admin-register", AdminRegistrationController, :create
     post "/v1/auth/login", SessionController, :create
     get "/v1/auth/check-handle", SessionController, :check_handle
@@ -113,7 +123,6 @@ defmodule MarrylocalWeb.Router do
     post "/v1/payments/phonepe/callback", PaymentController, :phonepe_callback
 
     # Legacy aliases kept for the existing mobile client during cut-over.
-    post "/users/register", RegistrationController, :create
     post "/users/login", SessionController, :create
     delete "/users/logout", SessionController, :delete
 
@@ -149,12 +158,17 @@ defmodule MarrylocalWeb.Router do
     get "/v1/profiles/lookup", ProfilesController, :lookup
     get "/v1/profiles/me", ProfilesController, :me
     patch "/v1/profiles/me", ProfilesController, :update
+    patch "/v1/profiles/me/location", ProfilesController, :update_location
     post "/v1/profiles/me/avatar", ProfilesController, :upload_avatar
     delete "/v1/profiles/me/avatar", ProfilesController, :delete_avatar
     delete "/v1/profiles/me/photos/:slot_index", ProfilesController, :delete_photo
 
+    # Itemized invoice history
+    get "/v1/billing/invoices", BillingController, :invoices
+
     # Identity verification lifecycle
     post "/v1/verifications/submit", VerificationController, :create
+    get "/v1/verifications/me", VerificationController, :show
     get "/v1/profiles/:id", ProfilesController, :show
     post "/v1/profiles/me/shortlist/:target_id", ProfilesController, :shortlist
 

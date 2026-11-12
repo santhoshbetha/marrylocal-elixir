@@ -51,6 +51,7 @@ defmodule Marrylocal.Discovery do
     with opposite when is_binary(opposite) <- opposite_gender(viewer.gender) do
       page = params |> fetch_int("page", 1) |> max(1)
       per_page = params |> fetch_int("per_page", @default_per_page) |> clamp(1, @max_per_page)
+      location = selected_location(viewer, params)
 
       base =
         User
@@ -63,8 +64,8 @@ defmodule Marrylocal.Discovery do
         |> apply_filters(params, viewer)
 
       case normalize_string(Map.get(params, "search_mode")) do
-        "full_city" -> discover_full_city(viewer, params, base, page, per_page)
-        _ -> discover_radius(viewer, params, base, page, per_page)
+        "full_city" -> discover_full_city(viewer, params, base, page, per_page, location)
+        _ -> discover_radius(viewer, params, base, page, per_page, location)
       end
     else
       nil -> {:error, :unsupported_gender}
@@ -73,8 +74,42 @@ defmodule Marrylocal.Discovery do
 
   def discover(_viewer, _params), do: {:error, :location_required}
 
-  defp discover_radius(viewer, params, base, page, per_page) do
-    case Geo.point_for(viewer) do
+  # Secondary slots are selected only when their monthly addon is active and
+  # they have pinned coordinates. Any expired/unpinned slot falls back to the
+  # primary location without failing the request.
+  defp selected_location(viewer, params) do
+    slot = normalize_string(Map.get(params, "location_slot") || "primary")
+
+    cond do
+      slot == "location_2" and secondary_slot_ready?(viewer, :location_2) ->
+        %{
+          slot: "location_2",
+          city: viewer.location_2_city,
+          point: {:ok, viewer.location_2_geom}
+        }
+
+      slot == "location_3" and secondary_slot_ready?(viewer, :location_3) ->
+        %{
+          slot: "location_3",
+          city: viewer.location_3_city,
+          point: {:ok, viewer.location_3_geom}
+        }
+
+      true ->
+        %{slot: "primary", city: viewer.city, point: Geo.point_for(viewer)}
+    end
+  end
+
+  defp secondary_slot_ready?(viewer, slot) do
+    geom = if slot == :location_2, do: viewer.location_2_geom, else: viewer.location_3_geom
+    city = if slot == :location_2, do: viewer.location_2_city, else: viewer.location_3_city
+
+    User.location_active?(viewer, slot) and is_binary(city) and
+      match?(%Elixir.Geo.Point{}, geom)
+  end
+
+  defp discover_radius(viewer, params, base, page, per_page, location) do
+    case location.point do
       {:ok, origin} ->
         radius_km = radius_for(viewer, params)
 
@@ -101,7 +136,8 @@ defmodule Marrylocal.Discovery do
         locale = %{
           search_mode: "radius",
           radius_km: radius_km,
-          city: viewer.city,
+          city: location.city,
+          location_slot: location.slot,
           latitude: elem(origin.coordinates, 1),
           longitude: elem(origin.coordinates, 0)
         }
@@ -113,8 +149,8 @@ defmodule Marrylocal.Discovery do
     end
   end
 
-  defp discover_full_city(viewer, params, base, page, per_page) do
-    case normalize_string(viewer.city) do
+  defp discover_full_city(viewer, params, base, page, per_page, location) do
+    case normalize_string(location.city) do
       nil ->
         {:error, :location_required}
 
@@ -127,7 +163,7 @@ defmodule Marrylocal.Discovery do
         total = Repo.aggregate(scoped, :count, :id)
 
         {profiles, ordering_origin} =
-          case Geo.point_for(viewer) do
+          case location.point do
             {:ok, origin} ->
               rows =
                 scoped
@@ -163,6 +199,7 @@ defmodule Marrylocal.Discovery do
           search_mode: "full_city",
           radius_km: nil,
           city: city,
+          location_slot: location.slot,
           latitude: ordering_origin && elem(ordering_origin.coordinates, 1),
           longitude: ordering_origin && elem(ordering_origin.coordinates, 0)
         }

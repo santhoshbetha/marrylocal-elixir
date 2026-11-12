@@ -12,7 +12,22 @@ defmodule MarrylocalWeb.VerificationController do
   alias Marrylocal.Accounts.Verifications
   alias MarrylocalWeb.IdentityVerificationJSON
 
-  @document_types ~w(aadhaar passport license)
+  @document_types ~w(passport license)
+
+  @doc "GET /api/v1/verifications/me"
+  def show(conn, _params) do
+    user = conn.assigns.current_user
+    verification = Verifications.get_for_user(user.id)
+
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      status: "success",
+      data: %{
+        verification: verification && IdentityVerificationJSON.owner(verification)
+      }
+    })
+  end
 
   def create(conn, params) do
     user = conn.assigns.current_user
@@ -32,6 +47,15 @@ defmodule MarrylocalWeb.VerificationController do
         |> put_status(:conflict)
         |> json(%{status: "error", message: "This account is already identity verified."})
 
+      {:error, :duplicate_identity} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          status: "error",
+          code: "duplicate_identity",
+          message: "This document number is already claimed by another verified account."
+        })
+
       {:error, :missing_document_image} ->
         conn
         |> put_status(:unprocessable_entity)
@@ -47,7 +71,7 @@ defmodule MarrylocalWeb.VerificationController do
         |> json(%{
           status: "error",
           code: "invalid_document_type",
-          message: "document_type must be aadhaar, passport, or license."
+          message: "document_type must be passport or license."
         })
 
       {:error, :invalid_document_number} ->

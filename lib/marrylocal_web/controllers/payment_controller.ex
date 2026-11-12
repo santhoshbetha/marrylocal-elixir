@@ -49,6 +49,16 @@ defmodule MarrylocalWeb.PaymentController do
   end
 
   defp initialize_checkout_for_items(conn, addons) do
+    case Accounts.validate_addon_locations(conn.assigns.current_user, addons) do
+      :ok ->
+        create_checkout_session(conn, addons)
+
+      {:error, :duplicate_location} ->
+        duplicate_location_error(conn)
+    end
+  end
+
+  defp create_checkout_session(conn, addons) do
     selected = Enum.filter(@addon_keys, &selected?(&1, addons))
 
     if selected == [] do
@@ -76,6 +86,15 @@ defmodule MarrylocalWeb.PaymentController do
           })
       end
     end
+  end
+
+  defp duplicate_location_error(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      message: "You already have this city assigned to another active location."
+    })
   end
 
   @doc """

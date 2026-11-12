@@ -31,12 +31,26 @@ defmodule Marrylocal.Uploaders.VerificationDocument do
   end
 
   def storage_dir(_version, {_file, verification}) do
-    "uploads/users/#{verification.user_id}/identity-verifications"
+    "private_kyc/users/#{verification.user_id}/identity-verifications"
   end
 
   def s3_object_headers(_version, {file, _verification}) do
     [content_type: Map.get(file, :content_type) || MIME.from_path(file.file_name)]
   end
+
+  @doc "Short-lived presigned GET URL for admin review previews."
+  def presigned_url(path, expires_in \\ 300)
+
+  def presigned_url(path, expires_in) when is_binary(path) and path != "" do
+    key = String.trim_leading(path, "/")
+
+    case ExAws.S3.presigned_url(:get, bucket(), key, expires_in: expires_in) do
+      {:ok, url} -> {:ok, url}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def presigned_url(_path, _expires_in), do: {:error, :missing_document}
 
   @doc "Deletes one stored document object from the configured R2 bucket."
   def delete_object(path) when is_binary(path) and path != "" do

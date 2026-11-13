@@ -332,6 +332,8 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
         |> activate()
         |> set_peer_progress(1)
 
+      MarrylocalWeb.Endpoint.subscribe("user_notifications:#{user.id}")
+
       body =
         conn
         |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
@@ -370,6 +372,17 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
       assert log.metadata["mode"] == "individual"
       assert log.metadata["credits"] == 6
       assert log.metadata["target_ids"] == [user.id]
+
+      assert_receive %Phoenix.Socket.Broadcast{
+        topic: "user_notifications:" <> _,
+        event: "peer_verification_updated",
+        payload: %{
+          reason: "admin_grant",
+          peer_verified: true,
+          peer_vouches_received: 3,
+          vouch_credits_remaining: 6
+        }
+      }
     end
 
     test "previews a city seed with profile-first, oldest-first ordering", %{mcp_conn: conn} do

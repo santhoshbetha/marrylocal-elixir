@@ -10,6 +10,7 @@ defmodule MarrylocalWeb.Admin.UserController do
 
   alias Marrylocal.Accounts
   alias Marrylocal.Admin.Audit
+  alias MarrylocalWeb.PeerVerificationNotifier
 
   @doc """
   `GET /api/v1/admin/users`
@@ -188,6 +189,8 @@ defmodule MarrylocalWeb.Admin.UserController do
           state: params["state"],
           city: params["city"]
         })
+
+        PeerVerificationNotifier.grants_applied(updated)
 
         json(conn, %{
           status: "success",

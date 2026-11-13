@@ -14,6 +14,7 @@ defmodule MarrylocalWeb.VouchController do
   alias Marrylocal.Repo
   alias Marrylocal.Verification.PeerVouchService
   alias Marrylocal.Verification.VouchCache
+  alias MarrylocalWeb.PeerVerificationNotifier
 
   @nearest_limit 5
 
@@ -38,6 +39,8 @@ defmodule MarrylocalWeb.VouchController do
     with true <- is_binary(secure_token) and secure_token != "",
          {:ok, vouchee_id} <- VouchCache.consume_token(secure_token),
          {:ok, result} <- PeerVouchService.process_peer_vouch(voucher.id, vouchee_id) do
+      PeerVerificationNotifier.vouch_recorded(result)
+
       json(conn, %{
         status: "success",
         message: "Peer vouch recorded.",

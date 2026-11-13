@@ -6,7 +6,9 @@ defmodule MarrylocalWeb.UserChannel do
   bearer user that authenticated the socket, otherwise the join is rejected.
   Every notification is scoped to a single user topic; presence state is
   tracked on the shared `presence` topic and pushed back through this private
-  channel.
+  channel. Peer-verification changes are broadcast on the same user topic as
+  `peer_verification_updated` and delivered automatically by the channel
+  server, so the Verification page does not need to poll.
   """
 
   use MarrylocalWeb, :channel

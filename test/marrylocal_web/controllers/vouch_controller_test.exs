@@ -104,9 +104,12 @@ defmodule MarrylocalWeb.VouchControllerTest do
 
   test "generate token and verify peer endpoint succeed, then duplicate is rejected", %{
     conn: conn,
+    vouchee: vouchee,
     vouchee_token: vouchee_token,
     verifiers: [voucher | _]
   } do
+    MarrylocalWeb.Endpoint.subscribe("user_notifications:#{vouchee.id}")
+
     token_conn =
       conn
       |> put_req_header("authorization", "Bearer #{vouchee_token}")
@@ -127,6 +130,17 @@ defmodule MarrylocalWeb.VouchControllerTest do
     assert vouch_body["current_vouches"] == 1
     refute vouch_body["peer_verified"]
     assert vouch_body["data"]["voucher_credits_remaining"] == 4
+
+    assert_receive %Phoenix.Socket.Broadcast{
+      topic: "user_notifications:" <> _,
+      event: "peer_verification_updated",
+      payload: %{
+        reason: "vouch",
+        peer_vouches_received: 1,
+        peer_verified: false,
+        vouch_credits_remaining: 0
+      }
+    }
 
     second_token_conn =
       conn

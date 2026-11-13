@@ -11,6 +11,7 @@ defmodule MarrylocalWeb.Admin.EmailController do
   require Logger
 
   alias Marrylocal.Admin.Audience
+  alias Marrylocal.Admin.Audit
   alias Marrylocal.Workers.BulkEmailWorker
 
   @email_regex ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -33,7 +34,27 @@ defmodule MarrylocalWeb.Admin.EmailController do
          {:ok, gender} <- validate_gender(params["gender"]),
          {:ok, mode} <- validate_mode(params["mode"] || infer_mode(params)),
          {:ok, emails} <- resolve_recipients(mode, params, gender) do
-      enqueue_batches(conn, emails, subject, content)
+      if params["dry_run"] == true do
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          status: "preview",
+          dry_run: true,
+          recipient_count: length(emails),
+          sample_recipients: Enum.take(emails, 5)
+        })
+      else
+        Audit.record(conn, "admin.emails.bulk_send", nil, %{
+          mode: mode,
+          gender: gender,
+          state: params["state"],
+          city: params["city"],
+          recipient_count: length(emails),
+          subject: subject
+        })
+
+        enqueue_batches(conn, emails, subject, content)
+      end
     else
       {:error, message} ->
         conn

@@ -18,19 +18,99 @@ defmodule MarrylocalWeb.UserAuth do
   @doc """
   Reads the `Authorization: Bearer ...` header and assigns `:current_user`.
 
+  Two credential forms are accepted:
+
+    * an opaque database-backed member session token, and
+    * the deployment-level `MCP_ADMIN_TOKEN`, which is only honoured for
+      `/api/v1/admin` paths and resolves to the admin account named by
+      `MCP_ADMIN_EMAIL`.
+
+  The static token is intentionally scoped to the admin API. It can never
+  authenticate a member route, even if the account it maps to is also a member.
+
   This plug never halts; compose it with `require_authenticated_api_user/2` on
   routes that require a session.
   """
   def fetch_current_user(conn, _opts) do
-    with ["Bearer " <> token] <- get_req_header(conn, "authorization"),
-         {user, _token_inserted_at} when not is_nil(user) <-
-           Accounts.get_user_by_session_token(token) do
-      Accounts.touch_last_seen(user)
-      Logger.metadata(user_id: user.id)
-      assign(conn, :current_user, user)
+    with ["Bearer " <> token] <- get_req_header(conn, "authorization") do
+      cond do
+        mcp_admin_token?(token) and admin_api_path?(conn) ->
+          assign_mcp_admin(conn)
+
+        true ->
+          assign_session_user(conn, token)
+      end
     else
       _ -> assign(conn, :current_user, nil)
     end
+  end
+
+  defp assign_session_user(conn, token) do
+    case Accounts.get_user_by_session_token(token) do
+      {user, _token_inserted_at} when not is_nil(user) ->
+        Accounts.touch_last_seen(user)
+        Logger.metadata(user_id: user.id)
+        assign(conn, :current_user, user)
+
+      _ ->
+        assign(conn, :current_user, nil)
+    end
+  end
+
+  defp assign_mcp_admin(conn) do
+    email =
+      "MCP_ADMIN_EMAIL"
+      |> System.get_env()
+      |> normalize_env()
+
+    user = email && Accounts.get_user_by_email(email)
+
+    if user && user.role in [:admin, "admin"] do
+      Logger.metadata(user_id: user.id, admin_client: "mcp")
+
+      conn
+      |> assign(:current_user, user)
+      |> assign(:mcp_authenticated, true)
+      |> assign(:admin_client, "mcp")
+    else
+      assign(conn, :current_user, nil)
+    end
+  end
+
+  @doc """
+  True when the request carries the deployment-level MCP admin credential.
+
+  Controllers and audit helpers use this when they need to know whether the
+  request was authenticated with the deployment token. For session-authenticated
+  requests, `X-Admin-Client: mcp` can still opt an admin write into the `mcp`
+  audit source; the default is `web_ui`.
+  """
+  def mcp_authenticated?(conn), do: conn.assigns[:mcp_authenticated] == true
+
+  defp mcp_admin_token?(token) when is_binary(token) do
+    case normalize_env(System.get_env("MCP_ADMIN_TOKEN")) do
+      configured when is_binary(configured) and byte_size(configured) >= 32 ->
+        Plug.Crypto.secure_compare(token, configured)
+
+      _ ->
+        false
+    end
+  end
+
+  defp mcp_admin_token?(_token), do: false
+
+  defp normalize_env(nil), do: nil
+
+  defp normalize_env(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp admin_api_path?(conn) do
+    path = conn.request_path || ""
+    path == "/api/v1/admin" or String.starts_with?(path, "/api/v1/admin/")
   end
 
   @doc "Halts with a clean 401 JSON payload when no bearer user is present."
@@ -57,9 +137,19 @@ defmodule MarrylocalWeb.UserAuth do
     end
   end
 
-  @doc "Requires a very recent login for sensitive API mutations."
+  @doc """
+  Requires a very recent login for sensitive API mutations.
+
+  The static MCP service token has no interactive session to refresh, so it is
+  exempt inside the admin API only. The token is long-lived by design and every
+  write it performs is audit-logged with `source: "mcp"`.
+  """
   def require_api_sudo_mode(conn, _opts) do
-    if conn.assigns[:current_user] && Accounts.sudo_mode?(conn.assigns.current_user, -10) do
+    sudo? =
+      conn.assigns[:current_user] &&
+        (mcp_authenticated?(conn) || Accounts.sudo_mode?(conn.assigns.current_user, -10))
+
+    if sudo? do
       conn
     else
       conn

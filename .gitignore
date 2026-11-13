@@ -38,3 +38,7 @@ npm-debug.log
 # Environment variables
 .env
 
+# Kamal deployment secrets must never be committed.
+/.kamal/secrets
+/.kamal/secrets.*
+

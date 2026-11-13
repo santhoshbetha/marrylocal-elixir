@@ -9,6 +9,7 @@ defmodule MarrylocalWeb.Admin.UserController do
   use MarrylocalWeb, :controller
 
   alias Marrylocal.Accounts
+  alias Marrylocal.Admin.Audit
 
   @doc """
   `GET /api/v1/admin/users`
@@ -71,6 +72,7 @@ defmodule MarrylocalWeb.Admin.UserController do
 
     case Accounts.admin_update_user(id, attrs) do
       {:ok, user} ->
+        Audit.record(conn, "admin.user.update", user.id, %{updates: attrs})
         json(conn, %{status: "success", data: %{user: serialize(user)}})
 
       {:error, %Ecto.Changeset{} = changeset} ->
@@ -104,6 +106,11 @@ defmodule MarrylocalWeb.Admin.UserController do
       when is_list(user_ids) and is_map(updates) do
     case Accounts.admin_bulk_update_users(user_ids, updates) do
       {:ok, count} ->
+        Audit.record(conn, "admin.users.bulk_update", nil, %{
+          user_ids: user_ids,
+          updates: updates
+        })
+
         json(conn, %{status: "success", updated_count: count})
 
       {:error, %Ecto.Changeset{} = changeset} ->

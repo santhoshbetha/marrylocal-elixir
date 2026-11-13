@@ -14,9 +14,11 @@ defmodule MarrylocalWeb.ProfilesController do
   alias Marrylocal.Relationships
   alias Marrylocal.Uploaders.Avatar
   alias Marrylocal.Uploaders.ProfilePhoto
+  alias Marrylocal.Workers.DeleteR2ObjectWorker
   alias MarrylocalWeb.UserJSON
 
   @max_photo_slots 10
+  @avatar_max_bytes 5 * 1024 * 1024
 
   @doc """
   GET /api/v1/profiles/discovery
@@ -196,6 +198,7 @@ defmodule MarrylocalWeb.ProfilesController do
     # browser would report as a CORS failure because the 500 has no headers).
     try do
       with {:ok, upload} <- extract_avatar_upload(params),
+           :ok <- Marrylocal.Uploads.validate_size(upload, @avatar_max_bytes),
            {:ok, photo_hash} <- ensure_unique_photo(user, upload),
            {:ok, destination} <- upload_destination(params) do
         case destination do
@@ -205,6 +208,12 @@ defmodule MarrylocalWeb.ProfilesController do
       else
         {:error, :duplicate_photo} ->
           duplicate_photo_error(conn)
+
+        {:error, :file_too_large} ->
+          file_too_large_error(conn, "Photos must be 5 MB or smaller.")
+
+        {:error, :invalid_upload} ->
+          invalid_avatar_error(conn)
 
         {:error, :missing_avatar} ->
           missing_avatar_error(conn)
@@ -243,9 +252,11 @@ defmodule MarrylocalWeb.ProfilesController do
   end
 
   defp upload_primary_avatar(conn, user, upload, photo_hash) do
-    case Accounts.update_avatar(user, %{avatar: upload}) do
+    old_avatar = user.avatar
+
+    case Accounts.update_avatar_with_photo_hash(user, %{avatar: upload}, photo_hash) do
       {:ok, updated} ->
-        if is_binary(photo_hash), do: Accounts.claim_photo_hash(updated, photo_hash, nil)
+        maybe_delete_replaced_avatar(user, old_avatar, updated.avatar)
 
         conn
         |> put_status(:created)
@@ -259,7 +270,12 @@ defmodule MarrylocalWeb.ProfilesController do
           }
         })
 
+      {:error, :duplicate_photo} ->
+        cleanup_rejected_avatar_upload(user, old_avatar, upload)
+        duplicate_photo_error(conn)
+
       {:error, %Ecto.Changeset{} = changeset} ->
+        cleanup_rejected_avatar_upload(user, old_avatar, upload)
         log_avatar_changeset_failure(conn, user, changeset)
         handle_avatar_changeset_error(conn, changeset)
 
@@ -271,12 +287,20 @@ defmodule MarrylocalWeb.ProfilesController do
 
   defp upload_profile_photo(conn, user, upload, slot_index, photo_hash) do
     scope = %{user_id: user.id, slot_index: slot_index}
+    old_url = user.images |> List.wrap() |> Enum.at(slot_index)
 
     case ProfilePhoto.store({upload, scope}) do
       {:ok, file_name} ->
         case ProfilePhoto.url({file_name, scope}) do
           image_url when is_binary(image_url) ->
-            persist_profile_photo(conn, user, image_url, slot_index, photo_hash)
+            persist_profile_photo(
+              conn,
+              user,
+              image_url,
+              slot_index,
+              photo_hash,
+              old_url
+            )
 
           _other ->
             Logger.error(
@@ -298,10 +322,15 @@ defmodule MarrylocalWeb.ProfilesController do
     end
   end
 
-  defp persist_profile_photo(conn, user, image_url, slot_index, photo_hash) do
-    case Accounts.update_user_image_at_slot(user, image_url, slot_index) do
+  defp persist_profile_photo(conn, user, image_url, slot_index, photo_hash, old_url) do
+    case Accounts.update_user_image_at_slot_with_photo_hash(
+           user,
+           image_url,
+           slot_index,
+           photo_hash
+         ) do
       {:ok, updated} ->
-        if is_binary(photo_hash), do: Accounts.claim_photo_hash(updated, photo_hash, slot_index)
+        maybe_delete_replaced_gallery_photo(old_url, image_url)
 
         conn
         |> put_status(:created)
@@ -315,7 +344,12 @@ defmodule MarrylocalWeb.ProfilesController do
           }
         })
 
+      {:error, :duplicate_photo} ->
+        cleanup_rejected_gallery_upload(image_url, old_url)
+        duplicate_photo_error(conn)
+
       {:error, %Ecto.Changeset{} = changeset} ->
+        cleanup_rejected_gallery_upload(image_url, old_url)
         log_avatar_changeset_failure(conn, user, changeset)
         handle_avatar_changeset_error(conn, changeset)
 
@@ -331,8 +365,11 @@ defmodule MarrylocalWeb.ProfilesController do
 
     case parse_slot_index(value) do
       {:ok, slot_index} ->
+        old_url = user.images |> List.wrap() |> Enum.at(slot_index)
+
         case Accounts.clear_user_image_at_slot(user, slot_index) do
           {:ok, updated} ->
+            enqueue_r2_delete(url_to_key(old_url))
             Accounts.release_photo_hash(updated, slot_index)
 
             conn
@@ -362,9 +399,11 @@ defmodule MarrylocalWeb.ProfilesController do
   @doc "DELETE /api/v1/profiles/me/avatar"
   def delete_avatar(conn, _params) do
     user = conn.assigns.current_user
+    old_avatar = user.avatar
 
     case Accounts.clear_avatar(user) do
       {:ok, updated} ->
+        enqueue_r2_delete(avatar_object_key(user, old_avatar))
         Accounts.release_photo_hash(updated, nil)
 
         conn
@@ -452,6 +491,113 @@ defmodule MarrylocalWeb.ProfilesController do
         {:ok, photo_hash}
     end
   end
+
+  defp file_too_large_error(conn, message) do
+    conn
+    |> put_status(:request_entity_too_large)
+    |> json(%{
+      status: "error",
+      code: "file_too_large",
+      message: message
+    })
+  end
+
+  defp maybe_delete_replaced_avatar(user, old_avatar, new_avatar) do
+    old_key = avatar_object_key(user, old_avatar)
+    new_key = avatar_object_key(user, new_avatar)
+
+    if old_key && old_key != new_key do
+      enqueue_r2_delete(old_key)
+    end
+
+    :ok
+  end
+
+  defp cleanup_rejected_avatar_upload(user, old_avatar, %Plug.Upload{} = upload) do
+    new_key = uploaded_avatar_object_key(user, upload)
+    old_key = avatar_object_key(user, old_avatar)
+
+    # With stable `original.<ext>` keys, a same-extension replacement has
+    # already overwritten the previous avatar. Deleting it here would break the
+    # row that the rolled-back transaction left intact, so only clean up a key
+    # that is genuinely new.
+    if new_key && new_key != old_key do
+      enqueue_r2_delete(new_key)
+    end
+
+    :ok
+  end
+
+  defp maybe_delete_replaced_gallery_photo(old_url, new_url) do
+    old_key = url_to_key(old_url)
+    new_key = url_to_key(new_url)
+
+    if old_key && old_key != new_key do
+      enqueue_r2_delete(old_key)
+    end
+
+    :ok
+  end
+
+  defp cleanup_rejected_gallery_upload(new_url, old_url) do
+    new_key = url_to_key(new_url)
+    old_key = url_to_key(old_url)
+
+    if new_key && new_key != old_key do
+      enqueue_r2_delete(new_key)
+    end
+
+    :ok
+  end
+
+  defp avatar_object_key(_user, nil), do: nil
+
+  defp avatar_object_key(user, %{file_name: file_name}) when is_binary(file_name) do
+    Path.join(
+      Avatar.storage_dir(:original, {%{file_name: file_name}, user}),
+      file_name
+    )
+  end
+
+  defp avatar_object_key(_user, _avatar), do: nil
+
+  defp uploaded_avatar_object_key(user, %Plug.Upload{} = upload) do
+    extension = upload.filename |> Path.extname() |> String.downcase()
+
+    if extension in ~w(.png .jpg .jpeg) do
+      Path.join(
+        Avatar.storage_dir(:original, {upload, user}),
+        "original#{extension}"
+      )
+    end
+  end
+
+  defp url_to_key(nil), do: nil
+
+  defp url_to_key(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{path: path} when is_binary(path) and path != "" ->
+        String.trim_leading(path, "/")
+
+      _ ->
+        nil
+    end
+  end
+
+  defp enqueue_r2_delete(nil), do: :ok
+
+  defp enqueue_r2_delete(key) when is_binary(key) and key != "" do
+    %{
+      bucket: System.get_env("AWS_S3_BUCKET") || "marrylocal",
+      key: String.trim_leading(key, "/")
+    }
+    |> DeleteR2ObjectWorker.new()
+    |> Oban.insert()
+
+    :ok
+  end
+
+  defp enqueue_r2_delete(_key), do: :ok
 
   defp duplicate_photo_error(conn) do
     conn

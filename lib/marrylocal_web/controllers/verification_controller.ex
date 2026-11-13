@@ -13,6 +13,7 @@ defmodule MarrylocalWeb.VerificationController do
   alias MarrylocalWeb.IdentityVerificationJSON
 
   @document_types ~w(passport license)
+  @document_max_bytes 8 * 1024 * 1024
 
   @doc "GET /api/v1/verifications/me"
   def show(conn, _params) do
@@ -33,6 +34,7 @@ defmodule MarrylocalWeb.VerificationController do
     user = conn.assigns.current_user
 
     with {:ok, attrs} <- extract_submission(params),
+         :ok <- Marrylocal.Uploads.validate_size(attrs["document_image"], @document_max_bytes),
          {:ok, verification} <- Verifications.submit(user, attrs) do
       conn
       |> put_status(:created)
@@ -42,6 +44,24 @@ defmodule MarrylocalWeb.VerificationController do
         data: %{verification: IdentityVerificationJSON.owner(verification)}
       })
     else
+      {:error, :file_too_large} ->
+        conn
+        |> put_status(:request_entity_too_large)
+        |> json(%{
+          status: "error",
+          code: "file_too_large",
+          message: "Document images must be 8 MB or smaller."
+        })
+
+      {:error, :invalid_upload} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          code: "invalid_upload",
+          message: "The uploaded document image could not be read."
+        })
+
       {:error, :already_verified} ->
         conn
         |> put_status(:conflict)

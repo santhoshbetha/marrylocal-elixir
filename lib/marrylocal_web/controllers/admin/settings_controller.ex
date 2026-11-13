@@ -9,26 +9,41 @@ defmodule MarrylocalWeb.Admin.SettingsController do
 
   use MarrylocalWeb, :controller
 
+  alias Marrylocal.Admin.Audit
   alias Marrylocal.Features
 
   def index(conn, _params) do
     json(conn, %{status: "success", data: %{settings: settings()}})
   end
 
+  def gating(conn, params), do: index(conn, params)
+
   def update(conn, params) do
     verification = gate_value(params, "enforce_verification_gate", "enforce_verification")
     payment = gate_value(params, "enforce_payment_gate", "enforce_payment")
 
+    fee =
+      get_in(params, ["settings", "default_annual_fee_inr"]) || params["default_annual_fee_inr"]
+
+    fee = normalize_fee(fee)
+
     cond do
-      is_nil(verification) and is_nil(payment) ->
+      is_nil(verification) and is_nil(payment) and is_nil(fee) ->
         invalid(conn)
 
-      not valid_gate?(verification) or not valid_gate?(payment) ->
+      not valid_gate?(verification) or not valid_gate?(payment) or not valid_fee?(fee) ->
         invalid(conn)
 
       true ->
         if is_boolean(verification), do: Features.put_enforce_verification_gate(verification)
         if is_boolean(payment), do: Features.put_enforce_payment_gate(payment)
+        if is_integer(fee), do: put_default_annual_fee(fee)
+
+        Audit.record(conn, "admin.settings.update", nil, %{
+          enforce_verification_gate: verification,
+          enforce_payment_gate: payment,
+          default_annual_fee_inr: fee
+        })
 
         json(conn, %{status: "success", data: %{settings: settings()}})
     end
@@ -37,8 +52,24 @@ defmodule MarrylocalWeb.Admin.SettingsController do
   defp settings do
     %{
       enforce_verification_gate: Features.enforce_verification_gate?(),
-      enforce_payment_gate: Features.enforce_payment_gate?()
+      enforce_payment_gate: Features.enforce_payment_gate?(),
+      default_annual_fee_inr: default_annual_fee()
     }
+  end
+
+  defp default_annual_fee do
+    :marrylocal
+    |> Application.get_env(:billing, [])
+    |> Keyword.get(:default_annual_fee_inr, 500)
+  end
+
+  defp put_default_annual_fee(value) do
+    billing =
+      :marrylocal
+      |> Application.get_env(:billing, [])
+      |> Keyword.put(:default_annual_fee_inr, value)
+
+    Application.put_env(:marrylocal, :billing, billing)
   end
 
   defp gate_value(params, primary, alias_key) do
@@ -58,13 +89,29 @@ defmodule MarrylocalWeb.Admin.SettingsController do
   defp valid_gate?(nil), do: true
   defp valid_gate?(value), do: is_boolean(value)
 
+  defp valid_fee?(nil), do: true
+  defp valid_fee?(value) when is_integer(value) and value > 0, do: true
+  defp valid_fee?(_value), do: false
+
+  defp normalize_fee(nil), do: nil
+  defp normalize_fee(value) when is_integer(value), do: value
+
+  defp normalize_fee(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} -> parsed
+      _ -> value
+    end
+  end
+
+  defp normalize_fee(value), do: value
+
   defp invalid(conn) do
     conn
     |> put_status(:unprocessable_entity)
     |> json(%{
       status: "error",
       message:
-        "Gate settings must be booleans: enforce_verification_gate and enforce_payment_gate"
+        "Settings must include booleans for gates and a positive integer default_annual_fee_inr"
     })
   end
 end

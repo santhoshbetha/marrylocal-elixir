@@ -40,6 +40,10 @@ defmodule MarrylocalWeb.Router do
     plug MarrylocalWeb.Plugs.RateLimitRegistration
   end
 
+  pipeline :rate_limit_uploads do
+    plug MarrylocalWeb.Plugs.RateLimitUploads
+  end
+
   pipeline :admin_required do
     plug :accepts, ["json"]
     plug :fetch_current_user
@@ -73,6 +77,7 @@ defmodule MarrylocalWeb.Router do
     pipe_through :admin_sudo_required
 
     get "/verifications", AdminVerificationController, :index
+    get "/verifications/:id", AdminVerificationController, :show
     post "/verifications/:id/approve", AdminVerificationController, :approve
     post "/verifications/:id/reject", AdminVerificationController, :reject
   end
@@ -89,8 +94,10 @@ defmodule MarrylocalWeb.Router do
     patch "/users/:id", UserController, :update
     post "/users/bulk-update", UserController, :bulk_update
     get "/settings", SettingsController, :index
+    get "/settings/gating", SettingsController, :gating
     patch "/settings", SettingsController, :update
     patch "/settings/gating", SettingsController, :update
+    get "/invoices", InvoiceController, :index
     post "/emails/bulk-send", EmailController, :bulk_send
     get "/emails/preview-count", EmailController, :preview_count
     post "/notifications/broadcast", NotificationController, :broadcast
@@ -140,8 +147,26 @@ defmodule MarrylocalWeb.Router do
   end
 
   # ---------------------------------------------------------------------------
+  # Public readiness probe
+  # ---------------------------------------------------------------------------
+  scope "/api", MarrylocalWeb do
+    pipe_through :api
+
+    get "/health", HealthController, :index
+  end
+
+  # ---------------------------------------------------------------------------
   # Authenticated API
   # ---------------------------------------------------------------------------
+  # Multipart uploads are rate limited per user before they reach the
+  # controller's hashing and R2 storage paths.
+  scope "/api", MarrylocalWeb do
+    pipe_through [:api_authenticated, :rate_limit_uploads]
+
+    post "/v1/profiles/me/avatar", ProfilesController, :upload_avatar
+    post "/v1/verifications/submit", VerificationController, :create
+  end
+
   # Discovery is authenticated and rate limited independently so search abuse
   # cannot exhaust the general API budget.
   scope "/api", MarrylocalWeb do
@@ -159,7 +184,6 @@ defmodule MarrylocalWeb.Router do
     get "/v1/profiles/me", ProfilesController, :me
     patch "/v1/profiles/me", ProfilesController, :update
     patch "/v1/profiles/me/location", ProfilesController, :update_location
-    post "/v1/profiles/me/avatar", ProfilesController, :upload_avatar
     delete "/v1/profiles/me/avatar", ProfilesController, :delete_avatar
     delete "/v1/profiles/me/photos/:slot_index", ProfilesController, :delete_photo
 
@@ -167,7 +191,6 @@ defmodule MarrylocalWeb.Router do
     get "/v1/billing/invoices", BillingController, :invoices
 
     # Identity verification lifecycle
-    post "/v1/verifications/submit", VerificationController, :create
     get "/v1/verifications/me", VerificationController, :show
     get "/v1/profiles/:id", ProfilesController, :show
     post "/v1/profiles/me/shortlist/:target_id", ProfilesController, :shortlist

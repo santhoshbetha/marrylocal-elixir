@@ -63,7 +63,8 @@ config :marrylocal, :billing,
 
 config :marrylocal, :kyc,
   provider: System.get_env("KYC_PROVIDER", "manual"),
-  identity_salt: System.get_env("KYC_IDENTITY_SALT", "marrylocal-manual-kyc-v1")
+  identity_salt: System.get_env("KYC_IDENTITY_SALT", "marrylocal-manual-kyc-v1"),
+  bucket: System.get_env("KYC_S3_BUCKET")
 
 # Cloudflare R2 is S3-compatible. Values are read at runtime so dev/test can
 # run without production credentials, while deployments override the account
@@ -75,14 +76,24 @@ get_env = fn key ->
   end
 end
 
-r2_scheme = get_env.("AWS_S3_SCHEME") || "https://"
+r2_endpoint = get_env.("R2_ENDPOINT")
+r2_endpoint_uri = if r2_endpoint, do: URI.parse(r2_endpoint), else: nil
+
+r2_scheme =
+  get_env.("AWS_S3_SCHEME") ||
+    if(r2_endpoint_uri && r2_endpoint_uri.scheme,
+      do: r2_endpoint_uri.scheme <> "://",
+      else: "https://"
+    )
 
 r2_host =
   get_env.("AWS_S3_HOST") ||
     get_env.("R2_ENDPOINT_HOST") ||
+    (r2_endpoint_uri && r2_endpoint_uri.host) ||
     "47701ef2e87f29505064cb21fd2513ed.r2.cloudflarestorage.com"
 
-r2_bucket = get_env.("AWS_S3_BUCKET") || "marrylocal"
+r2_bucket =
+  get_env.("AWS_S3_BUCKET") || get_env.("R2_BUCKET_NAME") || "marrylocal"
 
 r2_asset_host =
   get_env.("AWS_S3_ASSET_HOST") ||
@@ -100,6 +111,10 @@ config :ex_aws, :s3,
   scheme: r2_scheme,
   host: r2_host,
   region: get_env.("AWS_REGION") || "auto"
+
+config :ex_aws, :hackney_opts,
+  connect_timeout: 5_000,
+  recv_timeout: 60_000
 
 config :waffle,
   storage: Waffle.Storage.S3,
@@ -133,12 +148,25 @@ if config_env() == :prod do
       For example: ecto://USER:PASS@HOST/DATABASE
       """
 
-  config :marrylocal, Marrylocal.Repo,
+  ssl_enabled = String.downcase(System.get_env("DATABASE_SSL", "true")) in ["true", "1"]
+
+  repo_opts = [
     url: database_url,
-    pool_size: String.to_integer(System.get_env("DATABASE_POOL_SIZE") || "10"),
-    ssl: true,
-    ssl_opts: [verify: :verify_none],
+    pool_size:
+      String.to_integer(
+        System.get_env("POOL_SIZE") || System.get_env("DATABASE_POOL_SIZE") || "10"
+      ),
     socket_options: [keepalive: true]
+  ]
+
+  repo_opts =
+    if ssl_enabled do
+      Keyword.merge(repo_opts, ssl: true, ssl_opts: [verify: :verify_none])
+    else
+      repo_opts
+    end
+
+  config :marrylocal, Marrylocal.Repo, repo_opts
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

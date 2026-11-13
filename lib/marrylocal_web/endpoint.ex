@@ -34,6 +34,11 @@ defmodule MarrylocalWeb.Endpoint do
     gzip: not code_reloading?,
     only: MarrylocalWeb.static_paths()
 
+  # Container/platform health probe. Mounted before the dev-only repo-status
+  # check, parsers, and router so /health bypasses session, host, SSL, and API
+  # middleware entirely.
+  plug MarrylocalWeb.Plugs.HealthCheck
+
   # Code reloading can be explicitly enabled under the
   # :code_reloader configuration of your endpoint.
   if code_reloading? do

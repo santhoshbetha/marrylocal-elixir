@@ -1,0 +1,85 @@
+# Kamal 2 deployment for the MarryLocal Elixir JSON API.
+#
+# The React frontend is deployed separately through Cloudflare Wrangler. This
+# file only manages the Phoenix container and its PostgreSQL/PostGIS accessory.
+
+service: marrylocal-api
+
+# Kamal prepends registry.server to this image name when pushing and pulling.
+image: marrylocal/marrylocal-api
+
+registry:
+  server: registry.example.com
+  username: marrylocal
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+servers:
+  web:
+    # Replace with the production VPS IP. 203.0.113.10 is TEST-NET-3.
+    - 203.0.113.10
+
+# Build a single-architecture image for the target VPS. Set to true only when
+# the server fleet genuinely mixes CPU architectures.
+builder:
+  multiarch: false
+
+# Allow the release boot hook time to run migrations and start Phoenix before
+# kamal-proxy gives up on the new container.
+deploy_timeout: 120
+
+proxy:
+  ssl: true
+  host: api.marrylocal.in
+  app_port: 4000
+  response_timeout: 90
+  healthcheck:
+    path: /api/health
+    interval: 3
+    timeout: 5
+
+env:
+  clear:
+    PHX_HOST: api.marrylocal.in
+    PORT: "4000"
+    POOL_SIZE: "10"
+    FRONTEND_URL: https://marrylocal.in
+    HIDE_ADDONS_MARKPLACE: "true"
+    ENFORCE_VERIFICATION_GATE: "false"
+    ENFORCE_PAYMENT_GATE: "false"
+    DEFAULT_ANNUAL_FEE_INR: "500"
+    # The database is a private accessory on the Kamal Docker network, so TLS
+    # is not enabled on the container-to-container connection.
+    DATABASE_SSL: "false"
+  secret:
+    - DATABASE_URL
+    - SECRET_KEY_BASE
+    - RESEND_API_KEY
+    - AWS_ACCESS_KEY_ID
+    - AWS_SECRET_ACCESS_KEY
+    - R2_BUCKET_NAME
+    - R2_ENDPOINT
+    - PHONEPE_MERCHANT_ID
+    - PHONEPE_SALT_KEY
+    - PHONEPE_SALT_INDEX
+    - ADMIN_INVITE_CODE
+    - KYC_IDENTITY_SALT
+    - KYC_S3_BUCKET
+
+accessories:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    host: 203.0.113.10
+    # Bind PostgreSQL to loopback for operator access only. Containers reach it
+    # over the private `kamal` Docker network using the accessory DNS name.
+    port: "127.0.0.1:5432:5432"
+    env:
+      clear:
+        POSTGRES_DB: marrylocal_production
+        POSTGRES_USER: marrylocal
+      secret:
+        - POSTGRES_PASSWORD
+    directories:
+      - marrylocal_pg_data:/var/lib/postgresql/data
+    options:
+      restart: always

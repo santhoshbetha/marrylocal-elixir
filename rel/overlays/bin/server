@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+cd -P -- "$(dirname -- "$0")"
+
+# Execute migrations automatically right before the Phoenix web server
+# initializes. If the migration task fails, `set -e` stops the container before
+# it can receive live traffic.
+./marrylocal eval "Marrylocal.Release.migrate"
+
+PHX_SERVER=true exec ./marrylocal start

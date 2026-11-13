@@ -8,6 +8,9 @@ defmodule MarrylocalWeb.IdentityVerificationJSON do
       user_id: verification.user_id,
       document_type: verification.document_type,
       document_number: verification.document_number,
+      identity_hash: verification.identity_hash,
+      duplicate_identity_hash_warning:
+        Marrylocal.Accounts.Verifications.duplicate_identity_warning?(verification),
       document_image_url: document_url(verification),
       status: verification.status,
       rejection_reason: verification.rejection_reason,

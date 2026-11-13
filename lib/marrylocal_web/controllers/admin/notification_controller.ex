@@ -8,6 +8,7 @@ defmodule MarrylocalWeb.Admin.NotificationController do
   require Logger
 
   alias Marrylocal.Workers.SystemNotificationWorker
+  alias Marrylocal.Admin.Audit
 
   @target_types ~w(all location individual)
   @genders ~w(All Male Female)
@@ -35,18 +36,38 @@ defmodule MarrylocalWeb.Admin.NotificationController do
 
       estimated_recipients = SystemNotificationWorker.count_recipients(args)
 
-      case Oban.insert(SystemNotificationWorker.new(args)) do
-        {:ok, _job} ->
-          conn
-          |> put_status(:accepted)
-          |> json(%{status: "queued", estimated_recipients: estimated_recipients})
+      if params["dry_run"] == true do
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          status: "preview",
+          dry_run: true,
+          estimated_recipients: estimated_recipients,
+          target_type: target_type
+        })
+      else
+        case Oban.insert(SystemNotificationWorker.new(args)) do
+          {:ok, _job} ->
+            Audit.record(conn, "admin.notifications.broadcast", nil, %{
+              target_type: target_type,
+              state: params["state"],
+              city: params["city"],
+              gender: gender,
+              identifiers: identifiers,
+              estimated_recipients: estimated_recipients
+            })
 
-        {:error, reason} ->
-          Logger.error("Could not enqueue system notification: #{inspect(reason)}")
+            conn
+            |> put_status(:accepted)
+            |> json(%{status: "queued", estimated_recipients: estimated_recipients})
 
-          conn
-          |> put_status(:internal_server_error)
-          |> json(%{status: "error", error: "Could not queue the notification broadcast"})
+          {:error, reason} ->
+            Logger.error("Could not enqueue system notification: #{inspect(reason)}")
+
+            conn
+            |> put_status(:internal_server_error)
+            |> json(%{status: "error", error: "Could not queue the notification broadcast"})
+        end
       end
     else
       {:error, message} ->

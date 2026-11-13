@@ -1,0 +1,24 @@
+# Compiled artifacts and dependencies are rebuilt inside the image.
+_build
+deps
+cover
+doc
+tmp
+
+# Version control and local editor state.
+.git
+.gitignore
+.elixir_ls
+.vscode
+
+# Never bake deployment secrets or local environment files into an image.
+.kamal/secrets
+.kamal/secrets.*
+.env*
+
+# Tests, logs, and local crash dumps are not part of the production release.
+test
+*.log
+backend-test.log
+erl_crash.dump
+marrylocal-*.tar

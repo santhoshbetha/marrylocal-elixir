@@ -8,8 +8,6 @@ defmodule Marrylocal.Accounts.Verifications do
 
   import Ecto.Query, warn: false
 
-  require Logger
-
   alias Marrylocal.Accounts.IdentityVerification
   alias Marrylocal.Accounts.SignupGuard
   alias Marrylocal.Accounts.User
@@ -17,51 +15,105 @@ defmodule Marrylocal.Accounts.Verifications do
   alias Marrylocal.Notifications
   alias Marrylocal.Repo
   alias Marrylocal.Uploaders.VerificationDocument
+  alias Marrylocal.Workers.DeleteR2ObjectWorker
   alias Marrylocal.Workers.DuplicateAccountPurgeWorker
 
   @pending_status "pending_admin_review"
 
   @doc """
-  Creates or replaces the user's verification submission inside one transaction.
+  Creates or replaces the user's verification submission.
+
+  Waffle uploads the document while `IdentityVerification.changeset/2` is built.
+  That changeset is constructed before `Repo.transaction/1` so a slow mobile
+  upload never pins a PostgreSQL pool connection. The database phase only does
+  the uniqueness checks, insert/update, and status transition.
   """
   def submit(%User{} = user, attrs) do
     attrs = normalize_submission_attrs(attrs)
     identity_hash = SignupGuard.identity_hash(attrs["document_type"], attrs["document_number"])
 
-    Repo.transaction(fn ->
-      existing = Repo.get_by(IdentityVerification, user_id: user.id)
-      claimed = Repo.get_by(IdentityVerification, identity_hash: identity_hash)
+    case submission_gate(user, identity_hash) do
+      :ok ->
+        existing = Repo.get_by(IdentityVerification, user_id: user.id)
+        verification = existing || %IdentityVerification{user_id: user.id}
 
-      cond do
-        existing && existing.status == "verified" ->
-          Repo.rollback(:already_verified)
-
-        claimed && claimed.user_id != user.id ->
-          Repo.rollback(:duplicate_identity)
-
-        true ->
-          verification = existing || %IdentityVerification{user_id: user.id}
-
-          verification
-          |> IdentityVerification.changeset(
+        # This line performs the R2 upload via Waffle.Ecto. Keep it outside the
+        # transaction so the database is never held during network I/O.
+        changeset =
+          IdentityVerification.changeset(
+            verification,
             Map.merge(attrs, %{
               "identity_hash" => identity_hash,
               "status" => @pending_status
             })
           )
-          |> Repo.insert_or_update()
-          |> case do
-            {:ok, saved} ->
-              case VerificationProcessor.process_submission(saved) do
-                {:ok, processed} -> processed
-                {:error, reason} -> Repo.rollback(reason)
-              end
 
-            {:error, changeset} ->
-              Repo.rollback(changeset)
-          end
-      end
-    end)
+        result =
+          Repo.transaction(fn ->
+            case Repo.insert_or_update(changeset) do
+              {:ok, saved} ->
+                case VerificationProcessor.process_submission(saved) do
+                  {:ok, processed} -> processed
+                  {:error, reason} -> Repo.rollback(reason)
+                end
+
+              {:error, changeset} ->
+                Repo.rollback(changeset)
+            end
+          end)
+
+        case result do
+          {:ok, saved} ->
+            {:ok, saved}
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            cleanup_uploaded_document(changeset, verification)
+
+            if changeset.errors[:identity_hash] do
+              {:error, :duplicate_identity}
+            else
+              {:error, changeset}
+            end
+
+          {:error, reason} ->
+            cleanup_uploaded_document(changeset, verification)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp submission_gate(user, identity_hash) do
+    existing = Repo.get_by(IdentityVerification, user_id: user.id)
+    claimed = Repo.get_by(IdentityVerification, identity_hash: identity_hash)
+
+    cond do
+      existing && existing.status == "verified" -> {:error, :already_verified}
+      claimed && claimed.user_id != user.id -> {:error, :duplicate_identity}
+      true -> :ok
+    end
+  end
+
+  defp cleanup_uploaded_document(%Ecto.Changeset{} = changeset, verification) do
+    case Ecto.Changeset.get_change(changeset, :document_image) do
+      %{file_name: file_name} when is_binary(file_name) and file_name != "" ->
+        key =
+          Path.join(
+            VerificationDocument.storage_dir(:original, {%{file_name: file_name}, verification}),
+            file_name
+          )
+
+        %{bucket: VerificationDocument.bucket(), key: String.trim_leading(key, "/")}
+        |> DeleteR2ObjectWorker.new()
+        |> Oban.insert()
+
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   defp normalize_submission_attrs(attrs) do
@@ -77,21 +129,64 @@ defmodule Marrylocal.Accounts.Verifications do
 
   @doc "Returns all submissions waiting for an administrator decision."
   def list_pending do
-    from(v in IdentityVerification,
-      where: v.status == ^@pending_status,
-      order_by: [asc: v.inserted_at],
-      preload: [:user]
-    )
-    |> Repo.all()
+    list(%{})
   end
+
+  @doc "Returns submissions filtered by status and age in hours."
+  def list(params \\ %{}) when is_map(params) do
+    status = params["status"] || @pending_status
+    hours = parse_hours(params["older_than_hours"])
+
+    query =
+      from(v in IdentityVerification,
+        where: v.status == ^status,
+        order_by: [asc: v.inserted_at],
+        preload: [:user]
+      )
+
+    query =
+      if hours do
+        cutoff = DateTime.add(DateTime.utc_now(), -hours, :hour)
+        from(v in query, where: v.inserted_at <= ^cutoff)
+      else
+        query
+      end
+
+    Repo.all(query)
+  end
+
+  def duplicate_identity_warning?(%IdentityVerification{identity_hash: hash})
+      when hash in [nil, ""],
+      do: false
+
+  def duplicate_identity_warning?(%IdentityVerification{} = verification) do
+    from(v in IdentityVerification,
+      where: v.identity_hash == ^verification.identity_hash and v.id != ^verification.id,
+      select: count(v.id)
+    )
+    |> Repo.one()
+    |> Kernel.>(0)
+  end
+
+  defp parse_hours(value) when is_integer(value) and value >= 0, do: value
+
+  defp parse_hours(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {hours, ""} when hours >= 0 -> hours
+      _ -> nil
+    end
+  end
+
+  defp parse_hours(_value), do: nil
 
   @doc "Fetches one verification with its owning user preloaded."
   def get(id) do
-    IdentityVerification
-    |> Repo.get(id)
-    |> case do
-      nil -> nil
-      verification -> Repo.preload(verification, :user)
+    with true <- is_binary(id),
+         {:ok, uuid} <- Ecto.UUID.cast(id),
+         %IdentityVerification{} = verification <- Repo.get(IdentityVerification, uuid) do
+      Repo.preload(verification, :user)
+    else
+      _ -> nil
     end
   end
 
@@ -209,14 +304,17 @@ defmodule Marrylocal.Accounts.Verifications do
     })
   end
 
-  defp purge_document(%IdentityVerification{document_image: path}) do
-    case VerificationDocument.delete_object(path) do
-      :ok ->
-        :ok
+  defp purge_document(%IdentityVerification{document_image: path})
+       when is_binary(path) and path != "" do
+    %{
+      bucket: VerificationDocument.bucket(),
+      key: String.trim_leading(path, "/")
+    }
+    |> DeleteR2ObjectWorker.new()
+    |> Oban.insert()
 
-      {:error, reason} ->
-        Logger.warning("Could not purge identity document #{path}: #{inspect(reason)}")
-        :ok
-    end
+    :ok
   end
+
+  defp purge_document(_verification), do: :ok
 end

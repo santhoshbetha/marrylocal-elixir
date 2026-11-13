@@ -6,10 +6,11 @@ defmodule MarrylocalWeb.AdminVerificationController do
   use MarrylocalWeb, :controller
 
   alias Marrylocal.Accounts.Verifications
+  alias Marrylocal.Admin.Audit
   alias MarrylocalWeb.IdentityVerificationJSON
 
-  def index(conn, _params) do
-    verifications = Verifications.list_pending()
+  def index(conn, params) do
+    verifications = Verifications.list(params)
 
     conn
     |> put_status(:ok)
@@ -21,9 +22,27 @@ defmodule MarrylocalWeb.AdminVerificationController do
     })
   end
 
+  def show(conn, %{"id" => id}) do
+    case Verifications.get(id) do
+      nil ->
+        not_found(conn)
+
+      verification ->
+        json(conn, %{
+          status: "success",
+          data: %{verification: IdentityVerificationJSON.data(verification)}
+        })
+    end
+  end
+
   def approve(conn, %{"id" => id}) do
     with %{} = verification <- Verifications.get(id),
          {:ok, updated} <- Verifications.approve(verification) do
+      Audit.record(conn, "admin.verification.approve", updated.id, %{
+        user_id: updated.user_id,
+        document_type: updated.document_type
+      })
+
       conn
       |> put_status(:ok)
       |> json(%{
@@ -43,6 +62,12 @@ defmodule MarrylocalWeb.AdminVerificationController do
     with {:ok, reason} <- normalize_reason(reason),
          %{} = verification <- Verifications.get(id),
          {:ok, updated} <- Verifications.reject(verification, reason) do
+      Audit.record(conn, "admin.verification.reject", updated.id, %{
+        user_id: updated.user_id,
+        document_type: updated.document_type,
+        reason: reason
+      })
+
       conn
       |> put_status(:ok)
       |> json(%{

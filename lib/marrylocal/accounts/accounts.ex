@@ -186,6 +186,7 @@ defmodule Marrylocal.Accounts do
     User
     |> admin_apply_search(params["query"])
     |> admin_apply_location(params["state"], params["city"])
+    |> admin_apply_flags(params)
     |> order_by([u], desc: u.inserted_at, desc: u.id)
     |> limit(@admin_user_limit)
   end
@@ -324,6 +325,39 @@ defmodule Marrylocal.Accounts do
   end
 
   defp admin_filter_city(query, _city), do: query
+
+  # `unverified_only` means no identity document has ever been approved for the
+  # account. Email confirmation is tracked separately and is returned to the
+  # caller so it can decide whether that matters for a given triage task.
+  defp admin_apply_flags(query, params) do
+    query
+    |> admin_filter_unverified(admin_flag(params, :unverified_only, "unverified_only"))
+    |> admin_filter_paid(admin_flag(params, :paid_only, "paid_only"))
+  end
+
+  defp admin_filter_unverified(query, value) do
+    if truthy_flag?(value) do
+      where(
+        query,
+        [u],
+        (is_nil(u.aadhar_verified) or u.aadhar_verified == false) and
+          (is_nil(u.passport_verified) or u.passport_verified == false) and
+          (is_nil(u.license_verified) or u.license_verified == false)
+      )
+    else
+      query
+    end
+  end
+
+  defp admin_filter_paid(query, value) do
+    if truthy_flag?(value), do: where(query, [u], u.onetime_fees_paid == true), else: query
+  end
+
+  defp admin_flag(params, atom_key, string_key) do
+    Map.get(params, string_key) || Map.get(params, atom_key)
+  end
+
+  defp truthy_flag?(value), do: value in [true, "true", "1", 1]
 
   defp normalize_admin_user_id(id) when is_integer(id), do: id
 
@@ -1181,6 +1215,26 @@ defmodule Marrylocal.Accounts do
     |> Repo.update()
   end
 
+  @doc """
+  Stores the avatar and claims its fingerprint in one database transaction.
+
+  Waffle's R2 upload runs while `User.avatar_changeset/2` is built, before the
+  transaction starts. The user row and `user_photo_hashes` claim therefore commit
+  or roll back together, which closes the duplicate-upload race.
+  """
+  def update_avatar_with_photo_hash(%User{} = user, attrs, photo_hash) do
+    changeset = User.avatar_changeset(user, attrs)
+
+    Repo.transaction(fn ->
+      with {:ok, updated} <- Repo.update(changeset),
+           {:ok, _hash} <- claim_photo_hash_in_transaction(updated, photo_hash, nil) do
+        updated
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
   @doc "Clears the avatar reference. The R2 object is left for lifecycle cleanup."
   def clear_avatar(%User{} = user) do
     user
@@ -1215,6 +1269,49 @@ defmodule Marrylocal.Accounts do
     do: {:error, :invalid_slot_index}
 
   @doc """
+  Writes one gallery slot and claims its photo fingerprint atomically.
+
+  The R2 object is stored by `ProfilePhoto.store/1` before this function is
+  called. This transaction only owns the user row and `user_photo_hashes`, so a
+  duplicate fingerprint rolls both back and the controller can delete the
+  just-uploaded object.
+  """
+  def update_user_image_at_slot_with_photo_hash(
+        %User{} = user,
+        image_url,
+        slot_index,
+        photo_hash
+      )
+      when is_integer(slot_index) and slot_index >= 0 and slot_index < @max_profile_photos and
+             is_binary(image_url) do
+    images =
+      user.images
+      |> List.wrap()
+      |> pad_images_to_slot(slot_index)
+      |> List.replace_at(slot_index, image_url)
+
+    changeset = User.add_image_changeset(user, %{images: images})
+
+    Repo.transaction(fn ->
+      with {:ok, updated} <- Repo.update(changeset),
+           {:ok, _hash} <-
+             claim_photo_hash_in_transaction(updated, photo_hash, slot_index) do
+        updated
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  def update_user_image_at_slot_with_photo_hash(
+        _user,
+        _image_url,
+        _slot_index,
+        _photo_hash
+      ),
+      do: {:error, :invalid_slot_index}
+
+  @doc """
   Clears `images[slot_index]` without re-indexing the remaining photos.
 
   Indices stay stable so slot 4 does not become slot 3. Trailing nils are
@@ -1240,17 +1337,39 @@ defmodule Marrylocal.Accounts do
 
   def clear_user_image_at_slot(_user, _slot_index), do: {:error, :invalid_slot_index}
 
-  @doc "SHA-256 fingerprint for an uploaded profile image."
+  @photo_hash_chunk_size 1_048_576
+
+  @doc "SHA-256 fingerprint for an uploaded profile image, streamed in 1 MB chunks."
   def profile_photo_hash(path) when is_binary(path) do
-    if File.exists?(path) do
-      path
-      |> File.read!()
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
+    case File.open(path, [:read, :binary, :raw]) do
+      {:ok, io} ->
+        try do
+          hash_file(io, :crypto.hash_init(:sha256))
+        after
+          File.close(io)
+        end
+
+      {:error, _reason} ->
+        nil
     end
   end
 
   def profile_photo_hash(_path), do: nil
+
+  defp hash_file(io, state) do
+    case IO.binread(io, @photo_hash_chunk_size) do
+      :eof ->
+        state
+        |> :crypto.hash_final()
+        |> Base.encode16(case: :lower)
+
+      {:error, _reason} ->
+        nil
+
+      chunk ->
+        hash_file(io, :crypto.hash_update(state, chunk))
+    end
+  end
 
   @doc "True when another user already has this exact photo active."
   def photo_hash_claimed?(photo_hash, user_id) do
@@ -1264,32 +1383,60 @@ defmodule Marrylocal.Accounts do
 
   @doc "Claims a photo fingerprint for one user and slot."
   def claim_photo_hash(%User{} = user, photo_hash, slot_index) do
-    slot_index = normalize_photo_slot(slot_index)
-
     Repo.transaction(fn ->
-      existing = Repo.get_by(UserPhotoHash, photo_hash: photo_hash, active: true)
-
-      cond do
-        existing && existing.user_id != user.id ->
-          Repo.rollback(:duplicate_photo)
-
-        true ->
-          Repo.delete_all(
-            from(h in UserPhotoHash,
-              where: h.user_id == ^user.id and h.slot_index == ^slot_index
-            )
-          )
-
-          %UserPhotoHash{}
-          |> UserPhotoHash.changeset(%{
-            user_id: user.id,
-            photo_hash: photo_hash,
-            slot_index: slot_index,
-            active: true
-          })
-          |> Repo.insert()
+      case claim_photo_hash_in_transaction(user, photo_hash, slot_index) do
+        {:ok, hash} -> hash
+        {:error, reason} -> Repo.rollback(reason)
       end
     end)
+  end
+
+  # Shared by the public wrapper and the avatar/gallery update transactions.
+  # Returns {:ok, hash} or {:error, reason}; callers inside Repo.transaction
+  # must rollback themselves so the user row and claim commit together.
+  defp claim_photo_hash_in_transaction(_user, nil, _slot_index), do: {:ok, nil}
+
+  defp claim_photo_hash_in_transaction(%User{} = user, photo_hash, slot_index)
+       when is_binary(photo_hash) do
+    slot_index = normalize_photo_slot(slot_index)
+
+    existing = Repo.get_by(UserPhotoHash, photo_hash: photo_hash, active: true)
+
+    cond do
+      existing && existing.user_id != user.id ->
+        {:error, :duplicate_photo}
+
+      existing && existing.user_id == user.id ->
+        # The same member may reuse one exact image in another slot. The photo
+        # is already protected against other users by the active hash row.
+        {:ok, existing}
+
+      true ->
+        Repo.delete_all(
+          from(h in UserPhotoHash,
+            where: h.user_id == ^user.id and h.slot_index == ^slot_index
+          )
+        )
+
+        case %UserPhotoHash{}
+             |> UserPhotoHash.changeset(%{
+               user_id: user.id,
+               photo_hash: photo_hash,
+               slot_index: slot_index,
+               active: true
+             })
+             |> Repo.insert() do
+          {:ok, hash} ->
+            {:ok, hash}
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            if changeset.errors[:photo_hash] do
+              {:error, :duplicate_photo}
+            else
+              {:error, changeset}
+            end
+        end
+    end
   end
 
   @doc "Releases the fingerprint for a replaced or deleted photo slot."

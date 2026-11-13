@@ -22,8 +22,33 @@ defmodule Marrylocal.Uploaders.VerificationDocument do
   end
 
   def bucket do
-    System.get_env("AWS_S3_BUCKET") || "marrylocal"
+    configured =
+      :marrylocal
+      |> Application.get_env(:kyc, [])
+      |> Keyword.get(:bucket)
+      |> normalize_bucket()
+
+    case configured || normalize_bucket(System.get_env("KYC_S3_BUCKET")) do
+      value when is_binary(value) ->
+        value
+
+      _ ->
+        if Application.get_env(:marrylocal, :env) == :prod do
+          raise "KYC_S3_BUCKET must point to a private R2 bucket"
+        else
+          System.get_env("AWS_S3_BUCKET") || "marrylocal"
+        end
+    end
   end
+
+  defp normalize_bucket(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_bucket(_value), do: nil
 
   def filename(version, {file, _verification}) do
     extension = file.file_name |> Path.extname() |> String.downcase()

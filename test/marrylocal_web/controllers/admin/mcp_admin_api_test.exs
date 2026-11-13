@@ -14,6 +14,7 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
 
   alias Marrylocal.Accounts
   alias Marrylocal.Accounts.IdentityVerification
+  alias Marrylocal.Accounts.User
   alias Marrylocal.Admin.AuditLog
   alias Marrylocal.Billing.Invoice
   alias Marrylocal.Features
@@ -295,8 +296,274 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
     end
   end
 
+  describe "peer verifier grants" do
+    test "previews an individual grant without mutating or auditing", %{mcp_conn: conn} do
+      user =
+        user_fixture(%{city: "Delhi", state: "Delhi"})
+        |> activate()
+        |> set_peer_progress(1)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "identifier" => "@#{user.user_handle}",
+          "credits" => 7,
+          "dry_run" => true
+        })
+        |> json_response(200)
+
+      assert body["status"] == "preview"
+      assert body["mode"] == "individual"
+      assert body["credits_to_set"] == 7
+      assert body["target_count"] == 1
+      assert [%{"id" => id, "peer_verified" => false}] = body["targets"]
+      assert id == user.id
+
+      unchanged = Repo.get!(User, user.id)
+      refute unchanged.peer_verified
+      assert unchanged.peer_vouches_received == 1
+      assert unchanged.vouch_credits_remaining == 0
+      assert grant_logs() == []
+    end
+
+    test "grants one member and audits the MCP action", %{mcp_conn: conn} do
+      user =
+        user_fixture(%{city: "Delhi", state: "Delhi"})
+        |> activate()
+        |> set_peer_progress(1)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "identifier" => user.email,
+          "credits" => 6,
+          "dry_run" => false
+        })
+        |> json_response(200)
+
+      assert body["status"] == "success"
+      assert body["mode"] == "individual"
+      assert body["credits_to_set"] == 6
+      assert body["target_count"] == 1
+
+      assert [
+               %{
+                 "id" => id,
+                 "peer_verified" => true,
+                 "peer_vouches_received" => vouches,
+                 "vouch_credits_remaining" => 6
+               }
+             ] = body["users"]
+
+      assert id == user.id
+      assert vouches == 3
+
+      updated = Repo.get!(User, user.id)
+      assert updated.peer_verified
+      assert updated.peer_vouches_received == 3
+      assert updated.vouch_credits_remaining == 6
+
+      assert [log] = grant_logs()
+      assert log.source == "mcp"
+      assert log.action == "grant_peer_verifier"
+      assert log.target_id == to_string(user.id)
+      assert log.metadata["mode"] == "individual"
+      assert log.metadata["credits"] == 6
+      assert log.metadata["target_ids"] == [user.id]
+    end
+
+    test "previews a city seed with profile-first, oldest-first ordering", %{mcp_conn: conn} do
+      oldest =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(12)
+
+      complete =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(9)
+        |> set_avatar("avatar.png")
+
+      newest =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(1)
+
+      _already_verified =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> mark_peer_verified()
+
+      _mumbai = user_fixture(%{city: "Mumbai", state: "Maharashtra"}) |> activate()
+      inactive = user_fixture(%{city: "Hyderabad", state: "Telangana"}) |> deactivate()
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "state" => "Telangana",
+          "city" => "Hyderabad",
+          "limit" => 4,
+          "credits" => 6,
+          "dry_run" => true
+        })
+        |> json_response(200)
+
+      assert body["status"] == "preview"
+      assert body["mode"] == "city"
+      assert body["target_count"] == 3
+      assert body["credits_to_set"] == 6
+      assert Enum.map(body["targets"], & &1["id"]) == [complete.id, oldest.id, newest.id]
+      refute inactive.id in Enum.map(body["targets"], & &1["id"])
+
+      refute Repo.get!(User, oldest.id).peer_verified
+      refute Repo.get!(User, complete.id).peer_verified
+      assert grant_logs() == []
+    end
+
+    test "seeds a city up to the limit and preserves higher vouch counts", %{mcp_conn: conn} do
+      first =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(10)
+
+      second =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(8)
+        |> set_peer_progress(7)
+
+      third =
+        user_fixture(%{city: "Hyderabad", state: "Telangana"})
+        |> activate()
+        |> set_inserted_at(2)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "state" => "Telangana",
+          "city" => "Hyderabad",
+          "limit" => 2,
+          "credits" => 4,
+          "dry_run" => false
+        })
+        |> json_response(200)
+
+      assert body["status"] == "success"
+      assert body["mode"] == "city"
+      assert body["target_count"] == 2
+      assert body["credits_to_set"] == 4
+      assert Enum.map(body["users"], & &1["id"]) == [first.id, second.id]
+      assert Enum.all?(body["users"], & &1["peer_verified"])
+
+      assert %{"peer_vouches_received" => 3, "vouch_credits_remaining" => 4} =
+               Enum.find(body["users"], &(&1["id"] == first.id))
+
+      assert %{"peer_vouches_received" => 7, "vouch_credits_remaining" => 4} =
+               Enum.find(body["users"], &(&1["id"] == second.id))
+
+      assert Repo.get!(User, first.id).peer_verified
+      assert Repo.get!(User, first.id).vouch_credits_remaining == 4
+      assert Repo.get!(User, second.id).peer_vouches_received == 7
+      refute Repo.get!(User, third.id).peer_verified
+
+      assert [log] = grant_logs()
+      assert log.source == "mcp"
+      assert log.action == "grant_peer_verifier"
+      assert log.target_id == nil
+      assert log.metadata["mode"] == "city"
+      assert log.metadata["credits"] == 4
+      assert Enum.sort(log.metadata["target_ids"]) == Enum.sort([first.id, second.id])
+    end
+
+    test "rejects a grant without a target or location", %{mcp_conn: conn} do
+      body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{"credits" => 5})
+        |> json_response(400)
+
+      assert body["status"] == "error"
+      assert body["error"] =~ "identifier"
+    end
+
+    test "rejects out-of-range credits and an inactive identifier", %{mcp_conn: conn} do
+      user = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+
+      credits_body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "identifier" => user.email,
+          "credits" => 21
+        })
+        |> json_response(422)
+
+      assert credits_body["errors"]["credits"]
+
+      inactive = user_fixture(%{city: "Delhi", state: "Delhi"}) |> deactivate()
+
+      inactive_body =
+        conn
+        |> post(~p"/api/v1/admin/users/grant-peer-verifier", %{
+          "identifier" => inactive.email,
+          "credits" => 5
+        })
+        |> json_response(422)
+
+      assert inactive_body["error"] =~ "not active"
+    end
+  end
+
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp activate(user) do
+    user
+    |> Ecto.Changeset.change(user_state: :active)
+    |> Repo.update!()
+  end
+
+  defp deactivate(user) do
+    user
+    |> Ecto.Changeset.change(user_state: :inactive)
+    |> Repo.update!()
+  end
+
+  defp set_inserted_at(user, days_ago) do
+    inserted_at = DateTime.add(DateTime.utc_now(:second), -days_ago, :day)
+
+    user
+    |> Ecto.Changeset.change(inserted_at: inserted_at, updated_at: inserted_at)
+    |> Repo.update!()
+  end
+
+  defp set_peer_progress(user, vouches) do
+    user
+    |> Ecto.Changeset.change(peer_vouches_received: vouches)
+    |> Repo.update!()
+  end
+
+  defp mark_peer_verified(user) do
+    user
+    |> Ecto.Changeset.change(
+      peer_verified: true,
+      peer_vouches_received: 3,
+      vouch_credits_remaining: 5
+    )
+    |> Repo.update!()
+  end
+
+  defp set_avatar(user, file_name) do
+    user
+    |> Ecto.Changeset.change(avatar: %{file_name: file_name, updated_at: nil})
+    |> Repo.update!()
+  end
+
+  defp grant_logs do
+    Repo.all(
+      from l in AuditLog,
+        where: l.action == "grant_peer_verifier",
+        order_by: [asc: l.id]
+    )
+  end
 
   defp insert_invoice(user, number) do
     Repo.insert!(%Invoice{

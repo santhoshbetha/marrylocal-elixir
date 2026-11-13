@@ -267,6 +267,125 @@ defmodule Marrylocal.Accounts do
     end
   end
 
+  ## Peer verifier grants
+
+  @doc """
+  Resolves the targets for an administrative peer-verifier grant.
+
+  Two modes are supported:
+
+    * `%{"identifier" => value}` resolves one active member with
+      `admin_lookup_user/1` (email, `@handle`, phone, shortid, or numeric id).
+    * `%{"state" => state, "city" => city}` selects up to `limit` active
+      members who are not peer verified yet. Members with a complete profile
+      (avatar, edited core details, gallery photos) rank first, then the
+      oldest accounts.
+
+  Returns `{:ok, users, :individual | :city}` or `{:error, reason}`.
+  """
+  def admin_peer_grant_targets(params, limit)
+      when is_map(params) and is_integer(limit) and limit > 0 do
+    identifier = admin_trimmed(params["identifier"])
+
+    if identifier do
+      case admin_lookup_user(identifier) do
+        %User{user_state: :active} = user -> {:ok, [user], :individual}
+        %User{} -> {:error, :inactive_target}
+        nil -> {:error, :not_found}
+      end
+    else
+      state = admin_trimmed(params["state"])
+      city = admin_trimmed(params["city"])
+
+      cond do
+        is_nil(city) ->
+          {:error, :missing_target}
+
+        is_nil(state) ->
+          {:error, :missing_state}
+
+        true ->
+          users =
+            User
+            |> where([u], u.user_state == :active and u.peer_verified == false)
+            |> where([u], fragment("lower(?) = lower(?)", u.city, ^city))
+            |> where([u], fragment("lower(?) = lower(?)", u.state, ^state))
+            |> order_by(
+              [u],
+              desc:
+                fragment(
+                  "(CASE WHEN ? IS NULL THEN 0 ELSE 2 END) + (CASE WHEN ? THEN 1 ELSE 0 END) + (CASE WHEN COALESCE(array_length(?, 1), 0) > 0 THEN 1 ELSE 0 END)",
+                  u.avatar,
+                  u.core_details_edited,
+                  u.images
+                ),
+              asc: u.inserted_at,
+              asc: u.id
+            )
+            |> limit(^limit)
+            |> Repo.all()
+
+          {:ok, users, :city}
+      end
+    end
+  end
+
+  @doc """
+  Atomically marks the given users as peer verifiers with `credits` vouchers.
+
+  Each row gets `peer_verified: true`, a vouch count raised to at least 3, the
+  requested credit balance, and the verification gate cleared. Counts already
+  above 3 are preserved. Returns the updated users in the requested order.
+  """
+  def admin_grant_peer_verifiers(user_ids, credits)
+      when is_list(user_ids) and is_integer(credits) and credits > 0 do
+    ids =
+      user_ids
+      |> Enum.filter(&is_integer/1)
+      |> Enum.uniq()
+
+    if ids == [] do
+      {:ok, []}
+    else
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      Repo.transaction(fn ->
+        from(u in User,
+          where: u.id in ^ids,
+          update: [
+            set: [
+              peer_verified: true,
+              peer_vouches_received:
+                fragment("GREATEST(COALESCE(?, 0), 3)", u.peer_vouches_received),
+              vouch_credits_remaining: ^credits,
+              force_verification_required: false,
+              updated_at: ^now
+            ]
+          ]
+        )
+        |> Repo.update_all([])
+
+        by_id =
+          from(u in User, where: u.id in ^ids)
+          |> Repo.all()
+          |> Map.new(&{&1.id, &1})
+
+        ids
+        |> Enum.map(&Map.get(by_id, &1))
+        |> Enum.reject(&is_nil/1)
+      end)
+    end
+  end
+
+  defp admin_trimmed(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp admin_trimmed(_value), do: nil
+
   defp admin_apply_search(query, search) when is_binary(search) do
     terms =
       search

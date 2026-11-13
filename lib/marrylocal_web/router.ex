@@ -91,6 +91,7 @@ defmodule MarrylocalWeb.Router do
 
     get "/users", UserController, :index
     get "/users/lookup", UserController, :lookup
+    post "/users/grant-peer-verifier", UserController, :grant_peer_verifier
     patch "/users/:id", UserController, :update
     post "/users/bulk-update", UserController, :bulk_update
     get "/settings", SettingsController, :index

@@ -131,6 +131,173 @@ defmodule MarrylocalWeb.Admin.UserController do
     |> json(%{status: "error", error: "user_ids (list) and updates (object) are required"})
   end
 
+  @peer_grant_default_limit 10
+  @peer_grant_max_limit 25
+  @peer_grant_default_credits 5
+  @peer_grant_min_credits 1
+  @peer_grant_max_credits 20
+
+  @doc """
+  `POST /api/v1/admin/users/grant-peer-verifier`
+
+  Bootstraps the peer-verification chain from the admin console or the MCP
+  server.
+
+  Individual mode (grant or top up one member):
+
+      {"identifier": "priya@example.com", "credits": 5, "dry_run": false}
+
+  City seed mode (bootstrap a launch city):
+
+      {"state": "Telangana", "city": "Hyderabad", "limit": 10, "credits": 5}
+
+  `dry_run: true` returns the exact targets without writing. The live path
+  marks each target as peer verified, raises the vouch count to at least 3,
+  sets the requested credits, and writes an audit record.
+  """
+  def grant_peer_verifier(conn, params) do
+    with {:ok, credits} <- peer_grant_credits(params["credits"]),
+         {:ok, limit} <- peer_grant_limit(params["limit"]),
+         {:ok, targets, mode} <- Accounts.admin_peer_grant_targets(params, limit) do
+      if peer_grant_dry_run?(params["dry_run"]) do
+        json(conn, %{
+          status: "preview",
+          mode: Atom.to_string(mode),
+          target_count: length(targets),
+          targets: Enum.map(targets, &serialize/1),
+          credits_to_set: credits
+        })
+      else
+        apply_peer_grant(conn, targets, mode, credits, params)
+      end
+    else
+      {:error, reason} -> peer_grant_error(conn, reason)
+    end
+  end
+
+  defp apply_peer_grant(conn, targets, mode, credits, params) do
+    ids = Enum.map(targets, & &1.id)
+
+    case Accounts.admin_grant_peer_verifiers(ids, credits) do
+      {:ok, updated} ->
+        Audit.record(conn, "grant_peer_verifier", peer_grant_target_id(mode, ids), %{
+          mode: mode,
+          credits: credits,
+          target_ids: Enum.map(updated, & &1.id),
+          identifier: params["identifier"],
+          state: params["state"],
+          city: params["city"]
+        })
+
+        json(conn, %{
+          status: "success",
+          mode: Atom.to_string(mode),
+          target_count: length(updated),
+          credits_to_set: credits,
+          users: Enum.map(updated, &serialize/1)
+        })
+
+      {:error, reason} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          error: "Could not grant peer verifier status: #{inspect(reason)}"
+        })
+    end
+  end
+
+  defp peer_grant_target_id(:individual, [id | _]), do: id
+  defp peer_grant_target_id(_mode, _ids), do: nil
+
+  defp peer_grant_credits(nil), do: {:ok, @peer_grant_default_credits}
+  defp peer_grant_credits(""), do: {:ok, @peer_grant_default_credits}
+
+  defp peer_grant_credits(value) do
+    with {:ok, integer} <- peer_grant_integer(value),
+         true <- integer >= @peer_grant_min_credits and integer <= @peer_grant_max_credits do
+      {:ok, integer}
+    else
+      _ ->
+        {:error,
+         {:invalid, "credits",
+          "credits must be an integer between #{@peer_grant_min_credits} and #{@peer_grant_max_credits}."}}
+    end
+  end
+
+  defp peer_grant_limit(nil), do: {:ok, @peer_grant_default_limit}
+  defp peer_grant_limit(""), do: {:ok, @peer_grant_default_limit}
+
+  defp peer_grant_limit(value) do
+    with {:ok, integer} <- peer_grant_integer(value),
+         true <- integer >= 1 and integer <= @peer_grant_max_limit do
+      {:ok, integer}
+    else
+      _ ->
+        {:error,
+         {:invalid, "limit", "limit must be an integer between 1 and #{@peer_grant_max_limit}."}}
+    end
+  end
+
+  defp peer_grant_integer(value) when is_integer(value), do: {:ok, value}
+
+  defp peer_grant_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} -> {:ok, integer}
+      _ -> :error
+    end
+  end
+
+  defp peer_grant_integer(_value), do: :error
+
+  defp peer_grant_dry_run?(true), do: true
+  defp peer_grant_dry_run?(1), do: true
+
+  defp peer_grant_dry_run?(value) when is_binary(value) do
+    String.downcase(String.trim(value)) in ["true", "1"]
+  end
+
+  defp peer_grant_dry_run?(_value), do: false
+
+  defp peer_grant_error(conn, {:invalid, field, message}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{status: "error", error: message, errors: %{field => [message]}})
+  end
+
+  defp peer_grant_error(conn, :missing_target) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{status: "error", error: "Provide identifier, or both state and city."})
+  end
+
+  defp peer_grant_error(conn, :missing_state) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{status: "error", error: "state is required when seeding a city."})
+  end
+
+  defp peer_grant_error(conn, :not_found) do
+    conn
+    |> put_status(:not_found)
+    |> json(%{status: "error", error: "No member matched this identifier."})
+  end
+
+  defp peer_grant_error(conn, :inactive_target) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{status: "error", error: "The matched member is not active."})
+  end
+
+  defp peer_grant_error(conn, reason) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      error: "Could not resolve peer verifier targets: #{inspect(reason)}"
+    })
+  end
+
   # The admin UI historically used the long-form spellings. Expose both the
   # schema names and those aliases so older clients keep working.
   defp serialize(user) do

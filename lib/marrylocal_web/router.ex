@@ -192,6 +192,12 @@ defmodule MarrylocalWeb.Router do
 
     # Identity verification lifecycle
     get "/v1/verifications/me", VerificationController, :show
+
+    # Peer-to-peer vouch verification
+    post "/v1/vouch/generate-token", VouchController, :request_token
+    post "/v1/vouch/verify-peer", VouchController, :verify_peer
+    get "/v1/vouch/nearest-verifiers", VouchController, :nearest_verifiers
+
     get "/v1/profiles/:id", ProfilesController, :show
     post "/v1/profiles/me/shortlist/:target_id", ProfilesController, :shortlist
 

@@ -23,6 +23,9 @@ defmodule MarrylocalWeb.UserJSON do
       user_state: user.user_state,
       confirmed_at: user.confirmed_at,
       email_verified: user.email_verified || not is_nil(user.confirmed_at),
+      peer_verified: user.peer_verified,
+      peer_vouches_received: user.peer_vouches_received,
+      vouch_credits_remaining: user.vouch_credits_remaining,
       terms_accepted: user.terms_accepted,
       accepted_one_time_fees_amount: user.accepted_one_time_fees_amount,
       images: user.images,
@@ -70,6 +73,9 @@ defmodule MarrylocalWeb.UserJSON do
       coords_change_locked: coords_change_locked?(user),
       terms_accepted: user.terms_accepted,
       core_details_edited: user.core_details_edited,
+      peer_verified: user.peer_verified,
+      peer_vouches_received: user.peer_vouches_received,
+      vouch_credits_remaining: user.vouch_credits_remaining,
       onetime_fees_paid: user.onetime_fees_paid,
       onetime_fees_required: user.onetime_fees_required,
       accepted_one_time_fees_amount: user.accepted_one_time_fees_amount,
@@ -114,7 +120,11 @@ defmodule MarrylocalWeb.UserJSON do
       education_level: enum_value(user.education_level),
       economic_status: enum_value(user.economic_status),
       job_status: user.job_status,
-      verified: user.aadhar_verified || user.passport_verified || user.license_verified || false,
+      verified: id_verified?(user),
+      id_verified: id_verified?(user),
+      peer_verified: user.peer_verified,
+      peer_vouches_received: user.peer_vouches_received,
+      vouch_credits_remaining: user.vouch_credits_remaining,
       images: user.images,
       avatar_url: avatar_url(user),
       is_mutual: Map.get(user, :is_mutual, false),
@@ -152,6 +162,9 @@ defmodule MarrylocalWeb.UserJSON do
       is_mutual: user.is_mutual,
       last_login_at: user.time_of_login,
       onetime_fees_required: !user.onetime_fees_paid,
+      peer_verified: user.peer_verified,
+      peer_vouches_received: user.peer_vouches_received,
+      vouch_credits_remaining: user.vouch_credits_remaining,
       base_fee: 500,
       current_discount: discount,
       payable_amount: current_fee,
@@ -303,6 +316,10 @@ defmodule MarrylocalWeb.UserJSON do
 
   defp display_last_name(%{hide_last_name: true} = user), do: initial_last_name(user.last_name)
   defp display_last_name(user), do: user.last_name
+
+  defp id_verified?(user) do
+    user.aadhar_verified || user.passport_verified || user.license_verified || false
+  end
 
   defp initial_last_name(nil), do: nil
   defp initial_last_name(""), do: ""

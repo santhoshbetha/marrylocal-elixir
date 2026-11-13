@@ -70,6 +70,18 @@ defmodule Marrylocal.VerificationGateTest do
     assert {:ok, verified_result} = Accounts.evaluate_gating(verified)
     refute verified_result.force_verification_required
 
+    peer_verified =
+      gated
+      |> Ecto.Changeset.change(
+        peer_verified: true,
+        peer_vouches_received: 3,
+        vouch_credits_remaining: 5
+      )
+      |> Repo.update!()
+
+    assert {:ok, peer_result} = Accounts.evaluate_gating(peer_verified)
+    refute peer_result.force_verification_required
+
     fresh =
       verified_result
       |> Ecto.Changeset.change(inserted_at: now)

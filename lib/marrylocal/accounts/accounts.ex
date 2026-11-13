@@ -1522,6 +1522,8 @@ defmodule Marrylocal.Accounts do
         is_id_verified =
           user.aadhar_verified || user.passport_verified || user.license_verified
 
+        is_verified = user.peer_verified == true or is_id_verified
+
         days_since_creation =
           case user.inserted_at do
             %DateTime{} = inserted_at ->
@@ -1532,7 +1534,7 @@ defmodule Marrylocal.Accounts do
           end
 
         force_verification_required =
-          Features.enforce_verification_gate?() and not is_id_verified and
+          Features.enforce_verification_gate?() and not is_verified and
             days_since_creation and around_count > 50
 
         onetime_fees_required = user.onetime_fees_required || city_count > 250

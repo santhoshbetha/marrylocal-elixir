@@ -1023,6 +1023,30 @@ seeded_users =
       where: like(user.email, "%.test")
   )
 
+# The first ten deterministic verifiers in every city start with peer trust and
+# five vouch credits so the P2P chain can bootstrap locally.
+seeded_verifier_counts =
+  seeded_users
+  |> Enum.group_by(& &1.city)
+  |> Enum.map(fn {city, users} ->
+    ids =
+      users
+      |> Enum.sort_by(& &1.id)
+      |> Enum.take(10)
+      |> Enum.map(& &1.id)
+
+    Repo.update_all(
+      from(u in User, where: u.id in ^ids),
+      set: [
+        peer_verified: true,
+        peer_vouches_received: 3,
+        vouch_credits_remaining: 5
+      ]
+    )
+
+    {city, length(ids)}
+  end)
+
 broad_users =
   Repo.all(
     from user in User,
@@ -1151,6 +1175,14 @@ IO.puts(
 )
 
 IO.puts("PostGIS locations ready: #{located_count}/#{length(seeded_users)}")
+
+IO.puts(
+  "Peer verifiers seeded: " <>
+    (seeded_verifier_counts
+     |> Enum.map(fn {city, count} -> "#{city}=#{count}" end)
+     |> Enum.join(", "))
+)
+
 IO.puts("Dense max radius from Bangalore core: #{Float.round(dense_max_distance, 2)}km")
 IO.puts("Password for every account: #{password}")
 IO.puts("")

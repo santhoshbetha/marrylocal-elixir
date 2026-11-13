@@ -1,3 +1,4 @@
+# Deprecated: Use Marrylocal.Accounts functions for managing user images instead.
 defmodule Marrylocal.Uploads.Media do
   import Ecto.Query
   alias ExAws.S3

@@ -14,6 +14,7 @@ defmodule Marrylocal.Application do
       {Phoenix.PubSub, name: Marrylocal.PubSub},
       MarrylocalWeb.Presence,
       {Marrylocal.RateLimit, [clean_period: :timer.minutes(1)]},
+      Marrylocal.Verification.VouchCache,
       # Finch pool used by Swoosh's Resend API adapter.
       {Finch, name: Swoosh.Finch},
       # Start a worker by calling: Marrylocal.Worker.start_link(arg)

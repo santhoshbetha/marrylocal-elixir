@@ -25,7 +25,10 @@ defmodule Marrylocal.Accounts.User do
     :city,
     :force_verification_required,
     :community_search_active,
-    :sample_profile
+    :sample_profile,
+    :peer_verified,
+    :peer_vouches_received,
+    :vouch_credits_remaining
   ]
 
   # The admin UI and older mobile builds use the long-form spellings. Accept
@@ -106,6 +109,9 @@ defmodule Marrylocal.Accounts.User do
     field :is_beta_tester, :boolean, default: false
     field :community_search_active, :boolean, default: false
     field :multi_location_slots, :map, default: %{}
+    field :peer_verified, :boolean, default: false
+    field :peer_vouches_received, :integer, default: 0
+    field :vouch_credits_remaining, :integer, default: 0
     field :location_2_state, :string
     field :location_2_city, :string
     field :location_2_geom, Geo.PostGIS.Geometry
@@ -221,6 +227,8 @@ defmodule Marrylocal.Accounts.User do
     |> validate_number(:age, greater_than_or_equal_to: 18, less_than_or_equal_to: 120)
     |> validate_number(:max_search_distance, greater_than: 0, less_than_or_equal_to: 1000)
     |> validate_number(:accepted_one_time_fees_amount, greater_than_or_equal_to: 0)
+    |> validate_number(:peer_vouches_received, greater_than_or_equal_to: 0)
+    |> validate_number(:vouch_credits_remaining, greater_than_or_equal_to: 0)
   end
 
   defp normalize_admin_attrs(attrs) do

@@ -275,8 +275,27 @@ defmodule Marrylocal.Accounts.Verifications do
         {:error, :invalid_document_type}
 
       field ->
+        now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+        changes = %{field => true, verified_at: now}
+
+        changes =
+          if user.seed_verifier_status in ["invited", "opted_in"] do
+            Map.merge(changes, %{
+              seed_verifier_status: "approved",
+              peer_verified: true,
+              peer_vouches_received: max(user.peer_vouches_received || 0, 3),
+              is_peer_verifier: true,
+              vouch_credits_remaining: 5,
+              is_available_to_vouch: true,
+              force_verification_required: false
+            })
+          else
+            changes
+          end
+
         user
-        |> Ecto.Changeset.change(%{field => true})
+        |> Ecto.Changeset.change(changes)
         |> Repo.update()
     end
   end

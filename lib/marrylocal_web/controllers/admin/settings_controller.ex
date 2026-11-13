@@ -27,11 +27,18 @@ defmodule MarrylocalWeb.Admin.SettingsController do
 
     fee = normalize_fee(fee)
 
+    validity =
+      get_in(params, ["settings", "verification_validity_days"]) ||
+        params["verification_validity_days"]
+
+    validity = normalize_validity(validity)
+
     cond do
-      is_nil(verification) and is_nil(payment) and is_nil(fee) ->
+      is_nil(verification) and is_nil(payment) and is_nil(fee) and is_nil(validity) ->
         invalid(conn)
 
-      not valid_gate?(verification) or not valid_gate?(payment) or not valid_fee?(fee) ->
+      not valid_gate?(verification) or not valid_gate?(payment) or not valid_fee?(fee) or
+          not valid_validity?(validity) ->
         invalid(conn)
 
       true ->
@@ -39,10 +46,14 @@ defmodule MarrylocalWeb.Admin.SettingsController do
         if is_boolean(payment), do: Features.put_enforce_payment_gate(payment)
         if is_integer(fee), do: put_default_annual_fee(fee)
 
+        if is_integer(validity),
+          do: Features.put_verification_validity_days(validity)
+
         Audit.record(conn, "admin.settings.update", nil, %{
           enforce_verification_gate: verification,
           enforce_payment_gate: payment,
-          default_annual_fee_inr: fee
+          default_annual_fee_inr: fee,
+          verification_validity_days: validity
         })
 
         json(conn, %{status: "success", data: %{settings: settings()}})
@@ -53,7 +64,8 @@ defmodule MarrylocalWeb.Admin.SettingsController do
     %{
       enforce_verification_gate: Features.enforce_verification_gate?(),
       enforce_payment_gate: Features.enforce_payment_gate?(),
-      default_annual_fee_inr: default_annual_fee()
+      default_annual_fee_inr: default_annual_fee(),
+      verification_validity_days: Features.verification_validity_days()
     }
   end
 
@@ -105,13 +117,29 @@ defmodule MarrylocalWeb.Admin.SettingsController do
 
   defp normalize_fee(value), do: value
 
+  defp valid_validity?(nil), do: true
+  defp valid_validity?(value) when is_integer(value) and value >= 1 and value <= 3650, do: true
+  defp valid_validity?(_value), do: false
+
+  defp normalize_validity(nil), do: nil
+  defp normalize_validity(value) when is_integer(value), do: value
+
+  defp normalize_validity(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} -> parsed
+      _ -> value
+    end
+  end
+
+  defp normalize_validity(value), do: value
+
   defp invalid(conn) do
     conn
     |> put_status(:unprocessable_entity)
     |> json(%{
       status: "error",
       message:
-        "Settings must include booleans for gates and a positive integer default_annual_fee_inr"
+        "Settings must include booleans for gates, a positive integer default_annual_fee_inr, and verification_validity_days between 1 and 3650"
     })
   end
 end

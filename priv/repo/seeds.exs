@@ -1035,12 +1035,18 @@ seeded_verifier_counts =
       |> Enum.take(10)
       |> Enum.map(& &1.id)
 
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
     Repo.update_all(
       from(u in User, where: u.id in ^ids),
       set: [
         peer_verified: true,
         peer_vouches_received: 3,
-        vouch_credits_remaining: 5
+        vouch_credits_remaining: 5,
+        is_peer_verifier: true,
+        is_available_to_vouch: true,
+        seed_verifier_status: "approved",
+        verified_at: now
       ]
     )
 

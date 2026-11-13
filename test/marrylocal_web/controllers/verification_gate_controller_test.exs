@@ -73,9 +73,11 @@ defmodule MarrylocalWeb.VerificationGateControllerTest do
 
     token = token_for(admin)
     previous = Application.get_env(:marrylocal, :features)
+    previous_verification = Application.get_env(:marrylocal, :verification)
 
     on_exit(fn ->
       Application.put_env(:marrylocal, :features, previous || [])
+      Application.put_env(:marrylocal, :verification, previous_verification || [])
     end)
 
     conn =
@@ -85,22 +87,34 @@ defmodule MarrylocalWeb.VerificationGateControllerTest do
     initial = json_response(get(conn, ~p"/api/v1/admin/settings"), 200)
     assert is_boolean(initial["data"]["settings"]["enforce_verification_gate"])
     assert is_boolean(initial["data"]["settings"]["enforce_payment_gate"])
+    assert initial["data"]["settings"]["verification_validity_days"] == 730
 
     updated =
       json_response(
         patch(conn, ~p"/api/v1/admin/settings/gating", %{
           enforce_verification_gate: true,
-          enforce_payment_gate: true
+          enforce_payment_gate: true,
+          verification_validity_days: 365
         }),
         200
       )
 
     assert updated["data"]["settings"]["enforce_verification_gate"] == true
     assert updated["data"]["settings"]["enforce_payment_gate"] == true
+    assert updated["data"]["settings"]["verification_validity_days"] == 365
 
     refreshed = json_response(get(conn, ~p"/api/v1/admin/settings"), 200)
     assert refreshed["data"]["settings"]["enforce_verification_gate"] == true
     assert refreshed["data"]["settings"]["enforce_payment_gate"] == true
+    assert refreshed["data"]["settings"]["verification_validity_days"] == 365
+
+    invalid =
+      json_response(
+        patch(conn, ~p"/api/v1/admin/settings", %{verification_validity_days: 0}),
+        422
+      )
+
+    assert invalid["status"] == "error"
 
     disabled =
       json_response(

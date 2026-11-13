@@ -352,6 +352,9 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
                %{
                  "id" => id,
                  "peer_verified" => true,
+                 "is_peer_verifier" => true,
+                 "is_available_to_vouch" => true,
+                 "seed_verifier_status" => "approved",
                  "peer_vouches_received" => vouches,
                  "vouch_credits_remaining" => 6
                }
@@ -362,6 +365,10 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
 
       updated = Repo.get!(User, user.id)
       assert updated.peer_verified
+      assert updated.is_peer_verifier
+      assert updated.is_available_to_vouch
+      assert updated.seed_verifier_status == "approved"
+      assert updated.verified_at
       assert updated.peer_vouches_received == 3
       assert updated.vouch_credits_remaining == 6
 
@@ -379,6 +386,7 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
         payload: %{
           reason: "admin_grant",
           peer_verified: true,
+          is_peer_verifier: true,
           peer_vouches_received: 3,
           vouch_credits_remaining: 6
         }

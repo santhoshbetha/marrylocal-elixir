@@ -65,29 +65,21 @@ defmodule Marrylocal.Verification.PeerVouchService do
       query =
         from(u in User,
           where:
-            u.id == ^vouchee.id and u.peer_verified == false and
+            u.id == ^vouchee.id and u.is_peer_verifier == false and
               u.peer_vouches_received < ^@required_vouches
         )
 
       case repo.update_all(query, inc: [peer_vouches_received: 1]) do
         {1, _rows} -> {:ok, :credited}
-        _ -> {:error, :vouchee_already_verified}
+        _ -> {:error, :vouchee_vouch_limit_reached}
       end
     end)
     |> Multi.run(:promote, fn repo, %{context: %{voucher: voucher}} ->
       with %User{} = vouchee <- repo.get(User, vouchee_id) do
         vouchee_result =
-          if vouchee.peer_vouches_received >= @required_vouches and not vouchee.peer_verified do
-            vouchee
-            |> Ecto.Changeset.change(
-              peer_verified: true,
-              vouch_credits_remaining: @verifier_credit_grant,
-              force_verification_required: false
-            )
-            |> repo.update()
-          else
-            {:ok, vouchee}
-          end
+          vouchee
+          |> Ecto.Changeset.change(peer_verification_changes(vouchee))
+          |> repo.update()
 
         case vouchee_result do
           {:ok, updated_vouchee} ->
@@ -111,6 +103,34 @@ defmodule Marrylocal.Verification.PeerVouchService do
   end
 
   def process_peer_vouch(_voucher_id, _vouchee_id), do: {:error, :user_not_found}
+
+  # Milestone 1: the first valid vouch unlocks the member's account.
+  # Milestone 2: three vouches turn them into a verifier with five credits.
+  defp peer_verification_changes(%User{} = vouchee) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    changes = %{
+      peer_verified: true,
+      force_verification_required: false
+    }
+
+    changes =
+      if is_nil(vouchee.verified_at) do
+        Map.put(changes, :verified_at, now)
+      else
+        changes
+      end
+
+    if vouchee.peer_vouches_received >= @required_vouches and not vouchee.is_peer_verifier do
+      Map.merge(changes, %{
+        is_peer_verifier: true,
+        vouch_credits_remaining: @verifier_credit_grant,
+        is_available_to_vouch: true
+      })
+    else
+      changes
+    end
+  end
 
   defp validate(repo, voucher_id, vouchee_id) do
     if voucher_id == vouchee_id do
@@ -147,7 +167,7 @@ defmodule Marrylocal.Verification.PeerVouchService do
 
   defp ensure_voucher_can_vouch(_voucher), do: {:error, :no_vouch_credits}
 
-  defp ensure_vouchee_needs_vouch(%User{peer_verified: true}),
+  defp ensure_vouchee_needs_vouch(%User{is_peer_verifier: true}),
     do: {:error, :vouchee_already_verified}
 
   defp ensure_vouchee_needs_vouch(%User{peer_vouches_received: received})
@@ -181,6 +201,7 @@ defmodule Marrylocal.Verification.PeerVouchService do
        voucher: voucher,
        current_vouches: vouchee.peer_vouches_received,
        peer_verified: vouchee.peer_verified,
+       is_peer_verifier: vouchee.is_peer_verifier,
        vouch_credits_remaining: vouchee.vouch_credits_remaining
      }}
   end

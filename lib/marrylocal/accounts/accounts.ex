@@ -330,6 +330,30 @@ defmodule Marrylocal.Accounts do
     end
   end
 
+  @seed_verifier_statuses ~w(none invited opted_in opted_out approved)
+
+  @doc """
+  Moves a member through the seed-verifier recruitment states.
+
+  An approved verifier is never downgraded to `opted_in`; other transitions
+  (including opting out) are allowed.
+  """
+  def set_seed_verifier_status(%User{} = user, status)
+      when status in @seed_verifier_statuses do
+    cond do
+      user.seed_verifier_status == status ->
+        {:ok, user}
+
+      user.seed_verifier_status == "approved" and status == "opted_in" ->
+        {:ok, user}
+
+      true ->
+        user
+        |> Ecto.Changeset.change(seed_verifier_status: status)
+        |> Repo.update()
+    end
+  end
+
   @doc """
   Atomically marks the given users as peer verifiers with `credits` vouchers.
 
@@ -358,6 +382,10 @@ defmodule Marrylocal.Accounts do
               peer_vouches_received:
                 fragment("GREATEST(COALESCE(?, 0), 3)", u.peer_vouches_received),
               vouch_credits_remaining: ^credits,
+              is_peer_verifier: true,
+              is_available_to_vouch: true,
+              seed_verifier_status: "approved",
+              verified_at: ^now,
               force_verification_required: false,
               updated_at: ^now
             ]
@@ -1643,6 +1671,20 @@ defmodule Marrylocal.Accounts do
 
         is_verified = user.peer_verified == true or is_id_verified
 
+        approved_city_seed_verifiers_count =
+          if is_binary(user.city) do
+            from(u in User,
+              where:
+                u.user_state == :active and u.seed_verifier_status == "approved" and
+                  (u.peer_verified == true or u.aadhar_verified == true or
+                     u.passport_verified == true or u.license_verified == true),
+              where: fragment("lower(?) = lower(?)", u.city, ^user.city)
+            )
+            |> Repo.aggregate(:count, :id)
+          else
+            0
+          end
+
         days_since_creation =
           case user.inserted_at do
             %DateTime{} = inserted_at ->
@@ -1654,7 +1696,8 @@ defmodule Marrylocal.Accounts do
 
         force_verification_required =
           Features.enforce_verification_gate?() and not is_verified and
-            days_since_creation and around_count > 50
+            days_since_creation and around_count > 50 and
+            approved_city_seed_verifiers_count >= 10
 
         onetime_fees_required = user.onetime_fees_required || city_count > 250
         payment_expired? = user.onetime_fees_paid and annual_payment_expired?(user)

@@ -46,28 +46,40 @@ defmodule Marrylocal.Verification.PeerVouchTest do
     assert {:error, :token_invalid} = VouchCache.consume_token(token)
   end
 
-  test "three same-city verifiers promote the vouchee and grant five credits", %{
+  test "three same-city verifiers unlock access at one vouch and verifier status at three", %{
     vouchee: vouchee,
     verifiers: [first, second, third]
   } do
     assert {:ok, result} = PeerVouchService.process_peer_vouch(first.id, vouchee.id)
     assert result.current_vouches == 1
-    refute result.peer_verified
+    assert result.peer_verified
+    refute result.is_peer_verifier
+    assert result.vouch_credits_remaining == 0
     assert result.voucher.vouch_credits_remaining == 4
+
+    first_pass = Repo.get!(User, vouchee.id)
+    assert first_pass.peer_verified
+    assert first_pass.verified_at
+    refute first_pass.is_peer_verifier
 
     assert {:ok, result} = PeerVouchService.process_peer_vouch(second.id, vouchee.id)
     assert result.current_vouches == 2
-    refute result.peer_verified
+    assert result.peer_verified
+    refute result.is_peer_verifier
 
     assert {:ok, result} = PeerVouchService.process_peer_vouch(third.id, vouchee.id)
     assert result.current_vouches == 3
     assert result.peer_verified
+    assert result.is_peer_verifier
     assert result.vouch_credits_remaining == 5
 
     updated = Repo.get!(User, vouchee.id)
     assert updated.peer_verified
     assert updated.peer_vouches_received == 3
+    assert updated.is_peer_verifier
     assert updated.vouch_credits_remaining == 5
+    assert updated.is_available_to_vouch
+    assert updated.verified_at
 
     assert Repo.aggregate(from(v in PeerVouch, where: v.vouchee_id == ^vouchee.id), :count) == 3
 
@@ -110,7 +122,14 @@ defmodule Marrylocal.Verification.PeerVouchTest do
 
   defp make_verifier(user) do
     user
-    |> Ecto.Changeset.change(peer_verified: true, vouch_credits_remaining: 5)
+    |> Ecto.Changeset.change(
+      peer_verified: true,
+      peer_vouches_received: 3,
+      is_peer_verifier: true,
+      is_available_to_vouch: true,
+      vouch_credits_remaining: 5,
+      verified_at: DateTime.utc_now() |> DateTime.truncate(:second)
+    )
     |> Repo.update!()
   end
 end

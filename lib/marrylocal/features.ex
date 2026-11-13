@@ -76,6 +76,29 @@ defmodule Marrylocal.Features do
 
   def payment_enforcement_active?(_user), do: false
 
+  @doc """
+  Number of days a completed identity verification stays valid.
+
+  Admins can change this at runtime from the admin settings screen; the
+  default is 730 days (two years).
+  """
+  def verification_validity_days do
+    :marrylocal
+    |> Application.get_env(:verification, [])
+    |> Keyword.get(:validity_days, 730)
+  end
+
+  @doc "Updates the verification validity window without restarting the app."
+  def put_verification_validity_days(value) when is_integer(value) and value > 0 do
+    verification =
+      :marrylocal
+      |> Application.get_env(:verification, [])
+      |> Keyword.put(:validity_days, value)
+
+    Application.put_env(:marrylocal, :verification, verification)
+    value
+  end
+
   defp enabled?(value) when value in [true, "true", 1, "1"], do: true
   defp enabled?(_value), do: false
 end

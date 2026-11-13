@@ -197,6 +197,8 @@ defmodule MarrylocalWeb.Router do
     # Peer-to-peer vouch verification
     post "/v1/vouch/generate-token", VouchController, :request_token
     post "/v1/vouch/verify-peer", VouchController, :verify_peer
+    post "/v1/vouch/seed-opt-in", VouchController, :seed_opt_in
+    post "/v1/vouch/seed-opt-out", VouchController, :seed_opt_out
     get "/v1/vouch/nearest-verifiers", VouchController, :nearest_verifiers
 
     get "/v1/profiles/:id", ProfilesController, :show

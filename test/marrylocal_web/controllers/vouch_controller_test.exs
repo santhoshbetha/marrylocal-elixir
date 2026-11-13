@@ -1,9 +1,11 @@
 defmodule MarrylocalWeb.VouchControllerTest do
   use MarrylocalWeb.ConnCase, async: false
+  use Oban.Testing, repo: Marrylocal.Repo
 
   import Marrylocal.AccountsFixtures
 
   alias Marrylocal.Accounts
+  alias Marrylocal.Accounts.User
   alias Marrylocal.Repo
 
   setup %{conn: conn} do
@@ -60,7 +62,17 @@ defmodule MarrylocalWeb.VouchControllerTest do
 
     zero_credits =
       active_user(%{city: "Delhi", state: "Delhi"})
-      |> Ecto.Changeset.change(peer_verified: true, vouch_credits_remaining: 0)
+      |> Ecto.Changeset.change(
+        peer_verified: true,
+        is_peer_verifier: true,
+        vouch_credits_remaining: 0
+      )
+      |> Repo.update!()
+
+    unavailable =
+      active_user(%{city: "Delhi", state: "Delhi"})
+      |> make_verifier()
+      |> Ecto.Changeset.change(is_available_to_vouch: false)
       |> Repo.update!()
 
     vouchee_token = Accounts.generate_user_session_token(vouchee)
@@ -71,16 +83,18 @@ defmodule MarrylocalWeb.VouchControllerTest do
      vouchee_token: vouchee_token,
      verifiers: [verifier_one, verifier_two, verifier_three],
      mumbai: mumbai,
-     zero_credits: zero_credits}
+     zero_credits: zero_credits,
+     unavailable: unavailable}
   end
 
-  test "nearest verifiers returns only same-city members with credits", %{
+  test "nearest verifiers returns only available same-city verifiers with credits", %{
     conn: conn,
     vouchee: vouchee,
     vouchee_token: token,
     verifiers: verifiers,
     mumbai: mumbai,
-    zero_credits: zero_credits
+    zero_credits: zero_credits,
+    unavailable: unavailable
   } do
     conn =
       conn
@@ -93,6 +107,7 @@ defmodule MarrylocalWeb.VouchControllerTest do
     assert Enum.sort(returned_ids) == Enum.sort(Enum.map(verifiers, & &1.id))
     refute mumbai.id in returned_ids
     refute zero_credits.id in returned_ids
+    refute unavailable.id in returned_ids
     refute vouchee.id in returned_ids
 
     [first | _] = body["data"]["verifiers"]
@@ -128,7 +143,8 @@ defmodule MarrylocalWeb.VouchControllerTest do
 
     vouch_body = json_response(vouch_conn, 200)
     assert vouch_body["current_vouches"] == 1
-    refute vouch_body["peer_verified"]
+    assert vouch_body["peer_verified"]
+    refute vouch_body["is_peer_verifier"]
     assert vouch_body["data"]["voucher_credits_remaining"] == 4
 
     assert_receive %Phoenix.Socket.Broadcast{
@@ -137,7 +153,8 @@ defmodule MarrylocalWeb.VouchControllerTest do
       payload: %{
         reason: "vouch",
         peer_vouches_received: 1,
-        peer_verified: false,
+        peer_verified: true,
+        is_peer_verifier: false,
         vouch_credits_remaining: 0
       }
     }
@@ -175,6 +192,49 @@ defmodule MarrylocalWeb.VouchControllerTest do
     assert json_response(consumed_conn, 400)["code"] == "token_invalid"
   end
 
+  test "seed opt-in marks an invited member as opted in", %{
+    conn: conn,
+    vouchee: vouchee,
+    vouchee_token: token
+  } do
+    vouchee
+    |> Ecto.Changeset.change(seed_verifier_status: "invited")
+    |> Repo.update!()
+
+    body =
+      conn
+      |> put_req_header("authorization", "Bearer #{token}")
+      |> post(~p"/api/v1/vouch/seed-opt-in")
+      |> json_response(200)
+
+    assert body["data"]["profile"]["seed_verifier_status"] == "opted_in"
+    assert Repo.get!(User, vouchee.id).seed_verifier_status == "opted_in"
+  end
+
+  test "seed opt-out records the choice and refills the city pipeline", %{
+    conn: conn,
+    vouchee: vouchee,
+    vouchee_token: token
+  } do
+    vouchee
+    |> Ecto.Changeset.change(seed_verifier_status: "invited")
+    |> Repo.update!()
+
+    body =
+      conn
+      |> put_req_header("authorization", "Bearer #{token}")
+      |> post(~p"/api/v1/vouch/seed-opt-out")
+      |> json_response(200)
+
+    assert body["data"]["profile"]["seed_verifier_status"] == "opted_out"
+    assert Repo.get!(User, vouchee.id).seed_verifier_status == "opted_out"
+
+    assert_enqueued(
+      worker: Marrylocal.Workers.CitySeedRecruitmentWorker,
+      args: %{"city" => "Delhi", "state" => "Delhi"}
+    )
+  end
+
   defp active_user(attrs) do
     user_fixture(attrs)
     |> Ecto.Changeset.change(user_state: Map.get(attrs, :user_state, :active))
@@ -183,7 +243,14 @@ defmodule MarrylocalWeb.VouchControllerTest do
 
   defp make_verifier(user) do
     user
-    |> Ecto.Changeset.change(peer_verified: true, vouch_credits_remaining: 5)
+    |> Ecto.Changeset.change(
+      peer_verified: true,
+      peer_vouches_received: 3,
+      is_peer_verifier: true,
+      is_available_to_vouch: true,
+      vouch_credits_remaining: 5,
+      verified_at: DateTime.utc_now() |> DateTime.truncate(:second)
+    )
     |> Repo.update!()
   end
 

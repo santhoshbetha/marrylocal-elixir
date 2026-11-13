@@ -18,6 +18,7 @@ defmodule MarrylocalWeb.PeerVerificationNotifier do
       reason: "vouch",
       peer_vouches_received: result.current_vouches,
       peer_verified: result.peer_verified,
+      is_peer_verifier: result.is_peer_verifier,
       vouch_credits_remaining: result.vouch_credits_remaining
     })
   end
@@ -29,6 +30,7 @@ defmodule MarrylocalWeb.PeerVerificationNotifier do
         reason: "admin_grant",
         peer_vouches_received: user.peer_vouches_received,
         peer_verified: user.peer_verified,
+        is_peer_verifier: user.is_peer_verifier,
         vouch_credits_remaining: user.vouch_credits_remaining
       })
     end)

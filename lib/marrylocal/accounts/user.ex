@@ -28,7 +28,11 @@ defmodule Marrylocal.Accounts.User do
     :sample_profile,
     :peer_verified,
     :peer_vouches_received,
-    :vouch_credits_remaining
+    :vouch_credits_remaining,
+    :verified_at,
+    :is_peer_verifier,
+    :is_available_to_vouch,
+    :seed_verifier_status
   ]
 
   # The admin UI and older mobile builds use the long-form spellings. Accept
@@ -112,6 +116,10 @@ defmodule Marrylocal.Accounts.User do
     field :peer_verified, :boolean, default: false
     field :peer_vouches_received, :integer, default: 0
     field :vouch_credits_remaining, :integer, default: 0
+    field :verified_at, :utc_datetime
+    field :is_peer_verifier, :boolean, default: false
+    field :is_available_to_vouch, :boolean, default: true
+    field :seed_verifier_status, :string, default: "none"
     field :location_2_state, :string
     field :location_2_city, :string
     field :location_2_geom, Geo.PostGIS.Geometry
@@ -229,6 +237,7 @@ defmodule Marrylocal.Accounts.User do
     |> validate_number(:accepted_one_time_fees_amount, greater_than_or_equal_to: 0)
     |> validate_number(:peer_vouches_received, greater_than_or_equal_to: 0)
     |> validate_number(:vouch_credits_remaining, greater_than_or_equal_to: 0)
+    |> validate_inclusion(:seed_verifier_status, ~w(none invited opted_in opted_out approved))
   end
 
   defp normalize_admin_attrs(attrs) do
@@ -626,7 +635,8 @@ defmodule Marrylocal.Accounts.User do
       :allow_phone_search,
       :allow_handle_search,
       :terms_accepted,
-      :max_search_distance
+      :max_search_distance,
+      :is_available_to_vouch
     ])
     |> validate_length(:bio, max: 500)
     |> validate_handle()

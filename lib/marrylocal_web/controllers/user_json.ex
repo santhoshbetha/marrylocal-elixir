@@ -26,6 +26,13 @@ defmodule MarrylocalWeb.UserJSON do
       peer_verified: user.peer_verified,
       peer_vouches_received: user.peer_vouches_received,
       vouch_credits_remaining: user.vouch_credits_remaining,
+      is_peer_verifier: user.is_peer_verifier,
+      is_available_to_vouch: user.is_available_to_vouch,
+      seed_verifier_status: user.seed_verifier_status,
+      verified_at: user.verified_at,
+      verification_validity_days: Features.verification_validity_days(),
+      verification_expires_at: verification_expires_at(user),
+      id_verified: id_verified?(user),
       terms_accepted: user.terms_accepted,
       accepted_one_time_fees_amount: user.accepted_one_time_fees_amount,
       images: user.images,
@@ -76,6 +83,12 @@ defmodule MarrylocalWeb.UserJSON do
       peer_verified: user.peer_verified,
       peer_vouches_received: user.peer_vouches_received,
       vouch_credits_remaining: user.vouch_credits_remaining,
+      is_peer_verifier: user.is_peer_verifier,
+      is_available_to_vouch: user.is_available_to_vouch,
+      seed_verifier_status: user.seed_verifier_status,
+      verified_at: user.verified_at,
+      verification_validity_days: Features.verification_validity_days(),
+      verification_expires_at: verification_expires_at(user),
       onetime_fees_paid: user.onetime_fees_paid,
       onetime_fees_required: user.onetime_fees_required,
       accepted_one_time_fees_amount: user.accepted_one_time_fees_amount,
@@ -125,6 +138,7 @@ defmodule MarrylocalWeb.UserJSON do
       peer_verified: user.peer_verified,
       peer_vouches_received: user.peer_vouches_received,
       vouch_credits_remaining: user.vouch_credits_remaining,
+      is_peer_verifier: user.is_peer_verifier,
       images: user.images,
       avatar_url: avatar_url(user),
       is_mutual: Map.get(user, :is_mutual, false),
@@ -165,6 +179,10 @@ defmodule MarrylocalWeb.UserJSON do
       peer_verified: user.peer_verified,
       peer_vouches_received: user.peer_vouches_received,
       vouch_credits_remaining: user.vouch_credits_remaining,
+      is_peer_verifier: user.is_peer_verifier,
+      is_available_to_vouch: user.is_available_to_vouch,
+      seed_verifier_status: user.seed_verifier_status,
+      verified_at: user.verified_at,
       base_fee: 500,
       current_discount: discount,
       payable_amount: current_fee,
@@ -320,6 +338,12 @@ defmodule MarrylocalWeb.UserJSON do
   defp id_verified?(user) do
     user.aadhar_verified || user.passport_verified || user.license_verified || false
   end
+
+  defp verification_expires_at(%{verified_at: %DateTime{} = verified_at}) do
+    DateTime.add(verified_at, Features.verification_validity_days() * 86_400, :second)
+  end
+
+  defp verification_expires_at(_user), do: nil
 
   defp initial_last_name(nil), do: nil
   defp initial_last_name(""), do: ""

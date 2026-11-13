@@ -137,6 +137,8 @@ defmodule MarrylocalWeb.ProfilesController do
 
     case Accounts.update_profile_and_location(user, profile_attrs, coords) do
       {:ok, updated} ->
+        maybe_enqueue_seed_recruitment(user, updated)
+
         conn
         |> put_status(:ok)
         |> json(%{
@@ -163,6 +165,8 @@ defmodule MarrylocalWeb.ProfilesController do
 
     case Accounts.update_location_slot(user, slot, attrs) do
       {:ok, updated} ->
+        maybe_enqueue_seed_recruitment(user, updated)
+
         conn
         |> put_status(:ok)
         |> json(%{
@@ -963,6 +967,29 @@ defmodule MarrylocalWeb.ProfilesController do
   end
 
   defp present?(value), do: not is_nil(value) and value != ""
+
+  # A member joining or moving into a city can unblock the seed-verifier
+  # pipeline, so ask the recruitment worker to top that city up.
+  defp maybe_enqueue_seed_recruitment(previous, updated) do
+    if seed_city_changed?(previous, updated) do
+      %{"city" => updated.city, "state" => updated.state}
+      |> Marrylocal.Workers.CitySeedRecruitmentWorker.new()
+      |> Oban.insert()
+    end
+
+    :ok
+  end
+
+  defp seed_city_changed?(previous, updated) do
+    present?(updated.city) and present?(updated.state) and
+      (normalized_location(updated.city) != normalized_location(previous.city) or
+         normalized_location(updated.state) != normalized_location(previous.state))
+  end
+
+  defp normalized_location(value) when is_binary(value),
+    do: value |> String.trim() |> String.downcase()
+
+  defp normalized_location(_value), do: nil
 
   defp parse_id(id) when is_integer(id), do: {:ok, id}
 

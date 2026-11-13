@@ -10,6 +10,7 @@ defmodule MarrylocalWeb.VouchController do
 
   import Ecto.Query, warn: false
 
+  alias Marrylocal.Accounts
   alias Marrylocal.Accounts.User
   alias Marrylocal.Repo
   alias Marrylocal.Verification.PeerVouchService
@@ -46,10 +47,12 @@ defmodule MarrylocalWeb.VouchController do
         message: "Peer vouch recorded.",
         current_vouches: result.current_vouches,
         peer_verified: result.peer_verified,
+        is_peer_verifier: result.is_peer_verifier,
         vouch_credits_remaining: result.vouch_credits_remaining,
         data: %{
           current_vouches: result.current_vouches,
           peer_verified: result.peer_verified,
+          is_peer_verifier: result.is_peer_verifier,
           vouch_credits_remaining: result.vouch_credits_remaining,
           vouchee: serialize_user(result.vouchee),
           voucher_credits_remaining: result.voucher.vouch_credits_remaining
@@ -73,6 +76,43 @@ defmodule MarrylocalWeb.VouchController do
 
       {:error, reason} ->
         service_error(conn, reason)
+    end
+  end
+
+  @doc "POST /api/v1/vouch/seed-opt-in"
+  def seed_opt_in(conn, _params) do
+    user = conn.assigns.current_user
+
+    case Accounts.set_seed_verifier_status(user, "opted_in") do
+      {:ok, updated} ->
+        json(conn, %{
+          status: "success",
+          message:
+            "You joined the seed verifier list. Email your government ID to verify@marrylocal.in for approval.",
+          data: %{profile: %{seed_verifier_status: updated.seed_verifier_status}}
+        })
+
+      {:error, reason} ->
+        seed_status_error(conn, reason)
+    end
+  end
+
+  @doc "POST /api/v1/vouch/seed-opt-out"
+  def seed_opt_out(conn, _params) do
+    user = conn.assigns.current_user
+
+    case Accounts.set_seed_verifier_status(user, "opted_out") do
+      {:ok, updated} ->
+        enqueue_seed_recruitment(updated)
+
+        json(conn, %{
+          status: "success",
+          message: "You will not be invited as a seed verifier.",
+          data: %{profile: %{seed_verifier_status: updated.seed_verifier_status}}
+        })
+
+      {:error, reason} ->
+        seed_status_error(conn, reason)
     end
   end
 
@@ -135,8 +175,8 @@ defmodule MarrylocalWeb.VouchController do
   defp base_query(%User{} = user) do
     from(u in User,
       where:
-        u.id != ^user.id and u.user_state == :active and u.peer_verified == true and
-          u.vouch_credits_remaining > 0,
+        u.id != ^user.id and u.user_state == :active and u.is_peer_verifier == true and
+          u.is_available_to_vouch == true and u.vouch_credits_remaining > 0,
       where: fragment("lower(?) = lower(?)", u.city, ^user.city),
       limit: @nearest_limit
     )
@@ -192,9 +232,37 @@ defmodule MarrylocalWeb.VouchController do
       user_handle: user.user_handle,
       city: user.city,
       peer_verified: user.peer_verified,
+      is_peer_verifier: user.is_peer_verifier,
       peer_vouches_received: user.peer_vouches_received,
       vouch_credits_remaining: user.vouch_credits_remaining
     }
+  end
+
+  defp enqueue_seed_recruitment(%User{city: city, state: state})
+       when is_binary(city) and city != "" and is_binary(state) and state != "" do
+    %{"city" => city, "state" => state}
+    |> Marrylocal.Workers.CitySeedRecruitmentWorker.new()
+    |> Oban.insert()
+  end
+
+  defp enqueue_seed_recruitment(_user), do: :ok
+
+  defp seed_status_error(conn, %Ecto.Changeset{} = changeset) do
+    errors = Ecto.Changeset.traverse_errors(changeset, fn {message, _opts} -> message end)
+
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      status: "error",
+      message: "Could not update seed verifier status.",
+      errors: errors
+    })
+  end
+
+  defp seed_status_error(conn, _reason) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{status: "error", message: "Could not update seed verifier status."})
   end
 
   defp token_invalid(conn) do
@@ -239,7 +307,7 @@ defmodule MarrylocalWeb.VouchController do
           {"no_vouch_credits", "You have no vouch credits remaining."}
 
         :vouchee_already_verified ->
-          {"vouchee_already_verified", "This member is already peer verified."}
+          {"vouchee_already_verified", "This member is already a Peer Verifier."}
 
         :vouchee_vouch_limit_reached ->
           {"vouchee_vouch_limit_reached", "This member already has three peer vouches."}

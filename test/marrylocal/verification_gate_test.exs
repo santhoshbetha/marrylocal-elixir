@@ -53,13 +53,24 @@ defmodule Marrylocal.VerificationGateTest do
       |> Repo.insert!()
     end
 
+    # Nine admin-approved seed verifiers are not enough to open the gate.
+    for index <- 1..9 do
+      insert_seed_verifier(index, now)
+    end
+
     Features.put_enforce_verification_gate(false)
     assert {:ok, ungated} = Accounts.evaluate_gating(viewer)
-    assert ungated.around_user_count == 51
+    assert ungated.around_user_count == 60
     refute ungated.force_verification_required
 
     Features.put_enforce_verification_gate(true)
-    assert {:ok, gated} = Accounts.evaluate_gating(ungated)
+    assert {:ok, not_ready} = Accounts.evaluate_gating(ungated)
+    refute not_ready.force_verification_required
+
+    # The tenth approved seed verifier satisfies city readiness.
+    insert_seed_verifier(10, now)
+
+    assert {:ok, gated} = Accounts.evaluate_gating(not_ready)
     assert gated.force_verification_required
 
     verified =
@@ -75,7 +86,8 @@ defmodule Marrylocal.VerificationGateTest do
       |> Ecto.Changeset.change(
         peer_verified: true,
         peer_vouches_received: 3,
-        vouch_credits_remaining: 5
+        vouch_credits_remaining: 5,
+        is_peer_verifier: true
       )
       |> Repo.update!()
 
@@ -89,5 +101,31 @@ defmodule Marrylocal.VerificationGateTest do
 
     assert {:ok, fresh_result} = Accounts.evaluate_gating(fresh)
     refute fresh_result.force_verification_required
+  end
+
+  defp insert_seed_verifier(index, now) do
+    %User{
+      email: "gate-seed-#{index}-#{System.unique_integer([:positive])}@example.com",
+      phone_number: "+9198#{String.pad_leading(Integer.to_string(index), 8, "0")}",
+      referral_code: "SEED#{String.pad_leading(Integer.to_string(index), 6, "0")}",
+      first_name: "Seed",
+      last_name: "Verifier",
+      gender: "Male",
+      user_state: :active,
+      city: "Delhi",
+      state: "Delhi",
+      latitude: 28.6142,
+      longitude: 77.2092,
+      location: Geo.point(28.6142, 77.2092),
+      peer_verified: true,
+      peer_vouches_received: 3,
+      is_peer_verifier: true,
+      vouch_credits_remaining: 5,
+      seed_verifier_status: "approved",
+      verified_at: now,
+      inserted_at: now,
+      updated_at: now
+    }
+    |> Repo.insert!()
   end
 end

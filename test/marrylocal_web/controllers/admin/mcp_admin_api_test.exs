@@ -533,6 +533,227 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
     end
   end
 
+  describe "seed verifier queue" do
+    test "lists opted-in candidates with each city's approved progress", %{mcp_conn: conn} do
+      for index <- 1..3 do
+        insert_approved_seed("Hyderabad", "Telangana", index)
+      end
+
+      first = insert_seed_user("Hyderabad", "Telangana", "opted_in", 11)
+      second = insert_seed_user("Hyderabad", "Telangana", "opted_in", 12)
+      mumbai = insert_seed_user("Mumbai", "Maharashtra", "opted_in", 13)
+      _invited = insert_seed_user("Hyderabad", "Telangana", "invited", 14)
+
+      body =
+        conn
+        |> get(~p"/api/v1/admin/seed-verifiers")
+        |> json_response(200)
+
+      users = body["data"]["users"]
+      ids = Enum.map(users, & &1["id"])
+
+      assert body["data"]["target"] == 10
+      assert body["data"]["count"] == 3
+      assert Enum.sort(ids) == Enum.sort([first.id, second.id, mumbai.id])
+
+      hyderabad = Enum.find(users, &(&1["id"] == first.id))
+      assert hyderabad["seed_verifier_status"] == "opted_in"
+      assert hyderabad["approved_in_city"] == 3
+      assert hyderabad["target"] == 10
+      assert hyderabad["slots_remaining"] == 7
+      assert hyderabad["email"] == first.email
+
+      mumbai_row = Enum.find(users, &(&1["id"] == mumbai.id))
+      assert mumbai_row["approved_in_city"] == 0
+
+      filtered =
+        conn
+        |> get(~p"/api/v1/admin/seed-verifiers", %{"city" => "Hyderabad"})
+        |> json_response(200)
+
+      assert filtered["data"]["count"] == 2
+
+      invited =
+        conn
+        |> get(~p"/api/v1/admin/seed-verifiers", %{"status" => "invited"})
+        |> json_response(200)
+
+      assert invited["data"]["count"] == 1
+
+      assert conn
+             |> get(~p"/api/v1/admin/seed-verifiers", %{"status" => "bogus"})
+             |> json_response(422)
+             |> Map.fetch!("status") == "error"
+    end
+
+    test "previews a seed approval without mutating or auditing", %{mcp_conn: conn} do
+      for index <- 1..2 do
+        insert_approved_seed("Hyderabad", "Telangana", index)
+      end
+
+      candidate = insert_seed_user("Hyderabad", "Telangana", "opted_in", 21)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => candidate.email,
+          "credits" => 7,
+          "notes" => "Verified Driving License via email",
+          "dry_run" => true
+        })
+        |> json_response(200)
+
+      assert body["status"] == "preview"
+      assert body["data"]["approved_in_city"] == 2
+      assert body["data"]["target"] == 10
+      assert body["data"]["user"]["id"] == candidate.id
+      assert body["data"]["user"]["email"] == candidate.email
+      assert body["data"]["user"]["phone_number"] == candidate.phone_number
+      assert body["data"]["changes"]["seed_verifier_status"] == "approved"
+      assert body["data"]["changes"]["vouch_credits_remaining"] == 7
+
+      unchanged = Repo.get!(User, candidate.id)
+      assert unchanged.seed_verifier_status == "opted_in"
+      refute unchanged.peer_verified
+      refute unchanged.is_peer_verifier
+
+      assert Repo.aggregate(
+               from(l in AuditLog, where: l.action == "approve_seed_verifier"),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "approves a candidate and audits source mcp", %{mcp_conn: conn} do
+      for index <- 1..2 do
+        insert_approved_seed("Hyderabad", "Telangana", index)
+      end
+
+      candidate = insert_seed_user("Hyderabad", "Telangana", "opted_in", 31)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => "@#{candidate.user_handle}",
+          "credits" => 5,
+          "notes" => "Verified Driving License via email",
+          "dry_run" => false
+        })
+        |> json_response(200)
+
+      assert body["status"] == "success"
+      assert body["threshold_reached"] == false
+      assert body["data"]["approved_in_city"] == 3
+      assert body["data"]["user"]["seed_verifier_status"] == "approved"
+      assert body["data"]["user"]["is_peer_verifier"] == true
+      assert body["data"]["user"]["vouch_credits_remaining"] == 5
+
+      updated = Repo.get!(User, candidate.id)
+      assert updated.seed_verifier_status == "approved"
+      assert updated.peer_verified
+      assert updated.is_peer_verifier
+      assert updated.is_available_to_vouch
+      assert updated.vouch_credits_remaining == 5
+      assert updated.peer_vouches_received >= 3
+      assert updated.verified_at
+
+      log =
+        Repo.one(
+          from l in AuditLog,
+            where: l.action == "approve_seed_verifier",
+            order_by: [desc: l.id],
+            limit: 1
+        )
+
+      assert log.source == "mcp"
+      assert log.target_id == to_string(candidate.id)
+      assert log.metadata["city"] == "Hyderabad"
+      assert log.metadata["notes"] == "Verified Driving License via email"
+    end
+
+    test "reports when the tenth approval reaches the city threshold", %{mcp_conn: conn} do
+      for index <- 1..9 do
+        insert_approved_seed("Hyderabad", "Telangana", index)
+      end
+
+      candidate = insert_seed_user("Hyderabad", "Telangana", "opted_in", 41)
+
+      body =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => to_string(candidate.id),
+          "dry_run" => false
+        })
+        |> json_response(200)
+
+      assert body["threshold_reached"] == true
+      assert body["data"]["approved_in_city"] == 10
+      assert body["data"]["target"] == 10
+      assert body["message"] =~ "threshold is reached"
+    end
+
+    test "requires an override for invited candidates and blocks opted-out members", %{
+      mcp_conn: conn
+    } do
+      invited = insert_seed_user("Hyderabad", "Telangana", "invited", 51)
+      opted_out = insert_seed_user("Hyderabad", "Telangana", "opted_out", 52)
+      approved = insert_approved_seed("Hyderabad", "Telangana", 53)
+
+      rejected =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => invited.email,
+          "dry_run" => false
+        })
+        |> json_response(422)
+
+      assert rejected["code"] == "seed_status_not_opted_in"
+      refute Repo.get!(User, invited.id).peer_verified
+
+      accepted =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => invited.email,
+          "dry_run" => false,
+          "allow_override" => true
+        })
+        |> json_response(200)
+
+      assert accepted["data"]["user"]["seed_verifier_status"] == "approved"
+
+      opted_out_response =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => opted_out.email,
+          "dry_run" => false,
+          "allow_override" => true
+        })
+        |> json_response(422)
+
+      assert opted_out_response["code"] == "seed_status_opted_out"
+
+      already_approved =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => approved.email,
+          "dry_run" => false
+        })
+        |> json_response(422)
+
+      assert already_approved["code"] == "already_approved"
+
+      not_found =
+        conn
+        |> post(~p"/api/v1/admin/seed-verifiers/approve", %{
+          "identifier" => "missing@example.com",
+          "dry_run" => true
+        })
+        |> json_response(404)
+
+      assert not_found["status"] == "error"
+    end
+  end
+
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
 
@@ -584,6 +805,25 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
         where: l.action == "grant_peer_verifier",
         order_by: [asc: l.id]
     )
+  end
+
+  defp insert_seed_user(city, state, status, index) do
+    user_fixture(%{city: city, state: state, first_name: "Seed#{index}"})
+    |> activate()
+    |> Ecto.Changeset.change(seed_verifier_status: status)
+    |> Repo.update!()
+  end
+
+  defp insert_approved_seed(city, state, index) do
+    insert_seed_user(city, state, "approved", index)
+    |> Ecto.Changeset.change(
+      peer_verified: true,
+      is_peer_verifier: true,
+      peer_vouches_received: 3,
+      vouch_credits_remaining: 5,
+      verified_at: DateTime.utc_now() |> DateTime.truncate(:second)
+    )
+    |> Repo.update!()
   end
 
   defp insert_invoice(user, number) do

@@ -94,6 +94,8 @@ defmodule MarrylocalWeb.Router do
     post "/users/grant-peer-verifier", UserController, :grant_peer_verifier
     patch "/users/:id", UserController, :update
     post "/users/bulk-update", UserController, :bulk_update
+    get "/seed-verifiers", UserController, :seed_verifiers
+    post "/seed-verifiers/approve", UserController, :approve_seed_verifier
     get "/settings", SettingsController, :index
     get "/settings/gating", SettingsController, :gating
     patch "/settings", SettingsController, :update

@@ -414,6 +414,136 @@ defmodule Marrylocal.Accounts do
 
   defp admin_trimmed(_value), do: nil
 
+  @seed_verifier_target 10
+
+  @doc """
+  Lists seed-verifier candidates filtered by state, city, and status.
+
+  Each returned user is annotated with `approved_in_city`, the count of
+  admin-approved seed verifiers in that city.
+  """
+  def admin_seed_verifier_candidates(params) when is_map(params) do
+    case admin_seed_status(params["status"]) do
+      nil ->
+        {:error, :invalid_status}
+
+      status ->
+        users =
+          User
+          |> where([u], u.seed_verifier_status == ^status)
+          |> maybe_admin_state(admin_trimmed(params["state"]))
+          |> maybe_admin_city(admin_trimmed(params["city"]))
+          |> order_by([u], asc: u.city, asc: u.inserted_at, asc: u.id)
+          |> limit(500)
+          |> Repo.all()
+
+        counts =
+          users
+          |> Enum.map(&normalized_admin_city/1)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+          |> approved_seed_counts()
+
+        {:ok,
+         Enum.map(users, fn user ->
+           Map.put(user, :approved_in_city, Map.get(counts, normalized_admin_city(user), 0))
+         end)}
+    end
+  end
+
+  @doc "Counts active, currently verified, approved seed verifiers in a city."
+  def admin_approved_seed_verifier_count(city) when is_binary(city) do
+    User
+    |> where([u], u.user_state == :active and u.seed_verifier_status == "approved")
+    |> where(
+      [u],
+      u.peer_verified == true or u.aadhar_verified == true or u.passport_verified == true or
+        u.license_verified == true
+    )
+    |> where([u], fragment("lower(?) = lower(?)", u.city, ^city))
+    |> Repo.aggregate(:count, :id)
+  end
+
+  def admin_approved_seed_verifier_count(_city), do: 0
+
+  @doc "Atomically approves one opted-in seed candidate and grants verifier status."
+  def admin_approve_seed_verifier(%User{} = user, credits)
+      when is_integer(credits) and credits > 0 do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.transaction(fn ->
+      from(u in User,
+        where: u.id == ^user.id,
+        update: [
+          set: [
+            seed_verifier_status: "approved",
+            peer_verified: true,
+            peer_vouches_received:
+              fragment("GREATEST(COALESCE(?, 0), 3)", u.peer_vouches_received),
+            vouch_credits_remaining: ^credits,
+            is_peer_verifier: true,
+            is_available_to_vouch: true,
+            verified_at: ^now,
+            force_verification_required: false,
+            updated_at: ^now
+          ]
+        ]
+      )
+      |> Repo.update_all([])
+
+      Repo.get!(User, user.id)
+    end)
+  end
+
+  def admin_seed_target, do: @seed_verifier_target
+
+  defp admin_seed_status(nil), do: "opted_in"
+  defp admin_seed_status(""), do: "opted_in"
+
+  defp admin_seed_status(status) when is_binary(status) do
+    normalized = status |> String.trim() |> String.downcase()
+
+    if normalized in @seed_verifier_statuses, do: normalized
+  end
+
+  defp admin_seed_status(_status), do: nil
+
+  defp maybe_admin_state(query, state) when is_binary(state) and state != "" do
+    where(query, [u], fragment("lower(?) = lower(?)", u.state, ^state))
+  end
+
+  defp maybe_admin_state(query, _state), do: query
+
+  defp maybe_admin_city(query, city) when is_binary(city) and city != "" do
+    where(query, [u], fragment("lower(?) = lower(?)", u.city, ^city))
+  end
+
+  defp maybe_admin_city(query, _city), do: query
+
+  defp approved_seed_counts([]), do: %{}
+
+  defp approved_seed_counts(cities) do
+    lower_cities = Enum.map(cities, &String.downcase/1)
+
+    from(u in User,
+      where: u.user_state == :active and u.seed_verifier_status == "approved",
+      where: fragment("lower(?)", u.city) in ^lower_cities,
+      where:
+        u.peer_verified == true or u.aadhar_verified == true or u.passport_verified == true or
+          u.license_verified == true,
+      group_by: fragment("lower(?)", u.city),
+      select: {fragment("lower(?)", u.city), count(u.id)}
+    )
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  defp normalized_admin_city(%User{city: city}) when is_binary(city) do
+    city |> String.trim() |> String.downcase()
+  end
+
+  defp normalized_admin_city(_user), do: nil
+
   defp admin_apply_search(query, search) when is_binary(search) do
     terms =
       search

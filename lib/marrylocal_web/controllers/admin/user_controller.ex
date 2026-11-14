@@ -9,6 +9,7 @@ defmodule MarrylocalWeb.Admin.UserController do
   use MarrylocalWeb, :controller
 
   alias Marrylocal.Accounts
+  alias Marrylocal.Accounts.User
   alias Marrylocal.Admin.Audit
   alias MarrylocalWeb.PeerVerificationNotifier
 
@@ -300,6 +301,224 @@ defmodule MarrylocalWeb.Admin.UserController do
       error: "Could not resolve peer verifier targets: #{inspect(reason)}"
     })
   end
+
+  @seed_verifier_target 10
+
+  @doc """
+  `GET /api/v1/admin/seed-verifiers`
+
+  Lists seed-verifier candidates filtered by `state`, `city`, and `status`
+  (default `"opted_in"`). Every row includes the city's current
+  `approved_in_city` count and the 10-verifier target.
+  """
+  def seed_verifiers(conn, params) do
+    case Accounts.admin_seed_verifier_candidates(params) do
+      {:ok, users} ->
+        json(conn, %{
+          status: "success",
+          data: %{
+            users: Enum.map(users, &serialize_seed_candidate/1),
+            count: length(users),
+            target: @seed_verifier_target,
+            filters: %{
+              state: params["state"],
+              city: params["city"],
+              status: params["status"] || "opted_in"
+            }
+          }
+        })
+
+      {:error, :invalid_status} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          error: "status must be one of none, invited, opted_in, opted_out, or approved"
+        })
+    end
+  end
+
+  @doc """
+  `POST /api/v1/admin/seed-verifiers/approve`
+
+  Approves one opted-in seed candidate after their emailed ID has been
+  reviewed. `dry_run: true` returns the profile, the current city count, and the
+  exact changes; the live path updates the user and writes an audit record.
+
+  Candidates whose status is `invited` or `none` require
+  `allow_override: true`.
+  """
+  def approve_seed_verifier(conn, params) do
+    identifier = normalize_seed_identifier(params["identifier"])
+
+    cond do
+      is_nil(identifier) ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{status: "error", error: "identifier is required."})
+
+      true ->
+        case Accounts.admin_lookup_user(identifier) do
+          nil ->
+            conn
+            |> put_status(:not_found)
+            |> json(%{status: "error", error: "No member matched this identifier."})
+
+          %User{} = user ->
+            approve_seed_target(conn, user, identifier, params)
+        end
+    end
+  end
+
+  defp approve_seed_target(conn, user, identifier, params) do
+    with {:ok, credits} <- peer_grant_credits(params["credits"]),
+         :ok <- ensure_seed_status_approvable(user, peer_grant_dry_run?(params["allow_override"])) do
+      approved_before = Accounts.admin_approved_seed_verifier_count(user.city)
+
+      if peer_grant_dry_run?(params["dry_run"]) do
+        json(conn, %{
+          status: "preview",
+          data: %{
+            user: serialize_seed_candidate(user, approved_before),
+            approved_in_city: approved_before,
+            target: @seed_verifier_target,
+            changes: seed_approval_changes(user, credits),
+            notes: params["notes"],
+            warning:
+              if(user.seed_verifier_status == "opted_in",
+                do: nil,
+                else:
+                  "This candidate is #{user.seed_verifier_status}; confirming will override that status."
+              )
+          }
+        })
+      else
+        case Accounts.admin_approve_seed_verifier(user, credits) do
+          {:ok, updated} ->
+            Audit.record(conn, "approve_seed_verifier", updated.id, %{
+              city: updated.city,
+              notes: params["notes"],
+              credits: credits,
+              identifier: identifier
+            })
+
+            approved_after = Accounts.admin_approved_seed_verifier_count(updated.city)
+            threshold_reached = approved_after >= @seed_verifier_target
+
+            json(conn, %{
+              status: "success",
+              message:
+                if(threshold_reached,
+                  do:
+                    "#{updated.first_name} approved. #{updated.city} now has #{approved_after}/#{@seed_verifier_target} approved seed verifiers — the threshold is reached!",
+                  else:
+                    "#{updated.first_name} approved. #{updated.city} now has #{approved_after}/#{@seed_verifier_target} approved seed verifiers."
+                ),
+              threshold_reached: threshold_reached,
+              data: %{
+                user: serialize_seed_candidate(updated, approved_after),
+                approved_in_city: approved_after,
+                target: @seed_verifier_target,
+                threshold_reached: threshold_reached
+              }
+            })
+
+          {:error, reason} ->
+            conn
+            |> put_status(:unprocessable_entity)
+            |> json(%{
+              status: "error",
+              error: "Could not approve the seed verifier: #{inspect(reason)}"
+            })
+        end
+      end
+    else
+      {:error, {:invalid, _field, _message} = reason} ->
+        peer_grant_error(conn, reason)
+
+      {:error, :already_approved} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          code: "already_approved",
+          error: "This member is already an approved seed verifier."
+        })
+
+      {:error, :seed_status_opted_out} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          code: "seed_status_opted_out",
+          error: "This member opted out of seed verification and cannot be approved."
+        })
+
+      {:error, :seed_status_not_opted_in} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          status: "error",
+          code: "seed_status_not_opted_in",
+          error:
+            "This member is not opted in. Re-run with allow_override: true to approve an invited member."
+        })
+    end
+  end
+
+  defp ensure_seed_status_approvable(%User{seed_verifier_status: "opted_in"}, _override), do: :ok
+
+  defp ensure_seed_status_approvable(%User{seed_verifier_status: "approved"}, _override),
+    do: {:error, :already_approved}
+
+  defp ensure_seed_status_approvable(%User{seed_verifier_status: "opted_out"}, _override),
+    do: {:error, :seed_status_opted_out}
+
+  defp ensure_seed_status_approvable(%User{}, true), do: :ok
+
+  defp ensure_seed_status_approvable(%User{}, _override),
+    do: {:error, :seed_status_not_opted_in}
+
+  defp seed_approval_changes(%User{} = user, credits) do
+    %{
+      seed_verifier_status: "approved",
+      peer_verified: true,
+      is_peer_verifier: true,
+      peer_vouches_received: max(user.peer_vouches_received || 0, 3),
+      vouch_credits_remaining: credits,
+      is_available_to_vouch: true,
+      verified_at: DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+  end
+
+  defp serialize_seed_candidate(%User{} = user, approved_in_city \\ nil) do
+    annotated = Map.get(user, :approved_in_city)
+
+    count =
+      cond do
+        is_integer(approved_in_city) -> approved_in_city
+        is_integer(annotated) -> annotated
+        true -> Accounts.admin_approved_seed_verifier_count(user.city)
+      end
+
+    user
+    |> serialize()
+    |> Map.merge(%{
+      seed_verifier_status: user.seed_verifier_status,
+      approved_in_city: count,
+      target: @seed_verifier_target,
+      slots_remaining: max(@seed_verifier_target - count, 0)
+    })
+  end
+
+  defp normalize_seed_identifier(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_seed_identifier(_value), do: nil
 
   # The admin UI historically used the long-form spellings. Expose both the
   # schema names and those aliases so older clients keep working.

@@ -19,6 +19,7 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
   alias Marrylocal.Billing.Invoice
   alias Marrylocal.Features
   alias Marrylocal.Repo
+  alias Marrylocal.Reports
 
   @mcp_token "mcp-test-token-0123456789-abcdefghijklmnopqrstuvwxyz"
 
@@ -751,6 +752,164 @@ defmodule MarrylocalWeb.Admin.McpAdminApiTest do
         |> json_response(404)
 
       assert not_found["status"] == "error"
+    end
+  end
+
+  describe "user reports moderation" do
+    test "lists pending reports with member summaries and report totals", %{mcp_conn: conn} do
+      reporter_a = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      reporter_b = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      target = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      other_target = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+
+      {:ok, _} =
+        Reports.create_report(reporter_a, %{
+          "reported_user_id" => target.id,
+          "reason" => "harassment",
+          "details" => "Abusive messages."
+        })
+
+      {:ok, second} =
+        Reports.create_report(reporter_b, %{
+          "reported_user_id" => target.id,
+          "reason" => "scam_or_spam"
+        })
+
+      {:ok, _} =
+        Reports.create_report(reporter_a, %{
+          "reported_user_id" => other_target.id,
+          "reason" => "other"
+        })
+
+      body =
+        conn
+        |> get(~p"/api/v1/admin/reports")
+        |> json_response(200)
+
+      reports = body["data"]["reports"]
+      assert body["data"]["status"] == "pending"
+      assert length(reports) == 3
+
+      target_rows = Enum.filter(reports, &(&1["reported_user"]["id"] == target.id))
+      assert length(target_rows) == 2
+      assert Enum.all?(target_rows, &(&1["reported_user_report_count"] == 2))
+      assert Enum.all?(target_rows, &(&1["reported_user"]["email"] == target.email))
+
+      row = Enum.find(target_rows, &(&1["id"] == second.id))
+      assert row["reason"] == "scam_or_spam"
+      assert row["reporter"]["id"] == reporter_b.id
+      assert row["reported_user"]["user_handle"] == target.user_handle
+    end
+
+    test "dismisses a report and audits source mcp", %{mcp_conn: conn} do
+      reporter = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      target = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+
+      {:ok, report} =
+        Reports.create_report(reporter, %{
+          "reported_user_id" => target.id,
+          "reason" => "other"
+        })
+
+      body =
+        conn
+        |> patch(~p"/api/v1/admin/reports/#{report.id}", %{
+          "status" => "dismissed",
+          "admin_notes" => "No policy violation found."
+        })
+        |> json_response(200)
+
+      assert body["data"]["report"]["status"] == "dismissed"
+      assert body["data"]["report"]["admin_notes"] == "No policy violation found."
+      assert body["data"]["report"]["reviewed_at"]
+
+      log =
+        Repo.one(
+          from l in AuditLog,
+            where: l.action == "admin.report.review",
+            order_by: [desc: l.id],
+            limit: 1
+        )
+
+      assert log.source == "mcp"
+      assert log.target_id == to_string(report.id)
+      assert log.metadata["status"] == "dismissed"
+
+      dismissed =
+        conn
+        |> get(~p"/api/v1/admin/reports", %{"status" => "dismissed"})
+        |> json_response(200)
+
+      assert dismissed["data"]["count"] == 1
+    end
+
+    test "resolves a report and suspends the reported member", %{mcp_conn: conn} do
+      reporter = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      target = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+
+      {:ok, report} =
+        Reports.create_report(reporter, %{
+          "reported_user_id" => target.id,
+          "reason" => "fake_profile"
+        })
+
+      body =
+        conn
+        |> patch(~p"/api/v1/admin/reports/#{report.id}", %{
+          "status" => "reviewed_action_taken",
+          "suspend_user" => true,
+          "admin_notes" => "Confirmed impersonation."
+        })
+        |> json_response(200)
+
+      assert body["data"]["report"]["status"] == "reviewed_action_taken"
+      assert Repo.get!(User, target.id).user_state == :inactive
+
+      log =
+        Repo.one(
+          from l in AuditLog,
+            where: l.action == "admin.report.review",
+            order_by: [desc: l.id],
+            limit: 1
+        )
+
+      assert log.metadata["suspend_user"] == true
+    end
+
+    test "shows one report and rejects invalid or repeated decisions", %{mcp_conn: conn} do
+      reporter = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+      target = user_fixture(%{city: "Delhi", state: "Delhi"}) |> activate()
+
+      {:ok, report} =
+        Reports.create_report(reporter, %{
+          "reported_user_id" => target.id,
+          "reason" => "other"
+        })
+
+      shown =
+        conn
+        |> get(~p"/api/v1/admin/reports/#{report.id}")
+        |> json_response(200)
+
+      assert shown["data"]["report"]["id"] == report.id
+
+      invalid =
+        conn
+        |> patch(~p"/api/v1/admin/reports/#{report.id}", %{"status" => "pending"})
+        |> json_response(422)
+
+      assert invalid["status"] == "error"
+
+      assert conn
+             |> patch(~p"/api/v1/admin/reports/#{report.id}", %{"status" => "dismissed"})
+             |> json_response(200)
+
+      repeated =
+        conn
+        |> patch(~p"/api/v1/admin/reports/#{report.id}", %{"status" => "dismissed"})
+        |> json_response(422)
+
+      assert repeated["message"] == "This report has already been reviewed."
     end
   end
 

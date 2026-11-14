@@ -10,7 +10,9 @@ defmodule MarrylocalWeb.Admin.UserController do
 
   alias Marrylocal.Accounts
   alias Marrylocal.Accounts.User
+  alias Marrylocal.Accounts.Verifications
   alias Marrylocal.Admin.Audit
+  alias MarrylocalWeb.IdentityVerificationJSON
   alias MarrylocalWeb.PeerVerificationNotifier
 
   @doc """
@@ -58,6 +60,37 @@ defmodule MarrylocalWeb.Admin.UserController do
     conn
     |> put_status(:bad_request)
     |> json(%{status: "error", error: "query is required"})
+  end
+
+  @doc """
+  `GET /api/v1/admin/users/:id/verifications`
+
+  Returns the permanent identity-verification submission history for one
+  member, newest first.
+  """
+  def verification_history(conn, %{"id" => id}) do
+    user =
+      case Integer.parse(to_string(id)) do
+        {user_id, ""} -> Accounts.get_user(user_id)
+        _ -> nil
+      end
+
+    case user do
+      nil ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{status: "error", error: "User not found"})
+
+      %User{} = user ->
+        verifications = Verifications.history_for_user(user.id)
+
+        json(conn, %{
+          status: "success",
+          data: %{
+            verifications: Enum.map(verifications, &IdentityVerificationJSON.data/1)
+          }
+        })
+    end
   end
 
   @doc """

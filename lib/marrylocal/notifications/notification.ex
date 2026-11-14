@@ -13,7 +13,14 @@ defmodule Marrylocal.Notifications.Notification do
 
   alias Marrylocal.Accounts.User
 
-  @types [:profile_like, :mutual_match, :profile_shortlist, :system, :admin_broadcast]
+  @types [
+    :profile_like,
+    :mutual_match,
+    :profile_shortlist,
+    :system,
+    :admin_broadcast,
+    :verification_update
+  ]
 
   schema "notifications" do
     field :type, Ecto.Enum, values: @types

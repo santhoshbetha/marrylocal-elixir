@@ -18,7 +18,7 @@ defmodule Marrylocal.Notifications do
 
   @default_per_page 20
   @max_per_page 100
-  @visible_types [:profile_like, :mutual_match, :system]
+  @visible_types [:profile_like, :mutual_match, :system, :verification_update]
 
   def list_notifications(user_id, opts \\ [])
 
@@ -107,7 +107,9 @@ defmodule Marrylocal.Notifications do
     {long_lived, _} =
       Repo.delete_all(
         from(n in Notification,
-          where: n.type in [:system, :admin_broadcast] and n.inserted_at < ^long_lived_cutoff
+          where:
+            n.type in [:system, :admin_broadcast, :verification_update] and
+              n.inserted_at < ^long_lived_cutoff
         )
       )
 
@@ -115,7 +117,7 @@ defmodule Marrylocal.Notifications do
       Repo.delete_all(
         from(n in Notification,
           where:
-            n.type not in [:system, :admin_broadcast] and n.is_read == true and
+            n.type not in [:system, :admin_broadcast, :verification_update] and n.is_read == true and
               ((not is_nil(n.read_at) and n.read_at < ^read_cutoff) or
                  (is_nil(n.read_at) and n.updated_at < ^read_cutoff))
         )
@@ -125,8 +127,8 @@ defmodule Marrylocal.Notifications do
       Repo.delete_all(
         from(n in Notification,
           where:
-            n.type not in [:system, :admin_broadcast] and n.is_read == false and
-              n.inserted_at < ^unread_cutoff
+            n.type not in [:system, :admin_broadcast, :verification_update] and
+              n.is_read == false and n.inserted_at < ^unread_cutoff
         )
       )
 

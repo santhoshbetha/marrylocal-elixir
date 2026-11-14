@@ -30,6 +30,19 @@ defmodule MarrylocalWeb.VerificationController do
     })
   end
 
+  @doc "GET /api/v1/verifications/history"
+  def history(conn, _params) do
+    user = conn.assigns.current_user
+    verifications = Verifications.history_for_user(user.id)
+
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      status: "success",
+      data: %{verifications: IdentityVerificationJSON.history(verifications)}
+    })
+  end
+
   def create(conn, params) do
     user = conn.assigns.current_user
 
@@ -66,6 +79,15 @@ defmodule MarrylocalWeb.VerificationController do
         conn
         |> put_status(:conflict)
         |> json(%{status: "error", message: "This account is already identity verified."})
+
+      {:error, :already_pending} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          status: "error",
+          code: "already_pending",
+          message: "A verification submission is already under review."
+        })
 
       {:error, :duplicate_identity} ->
         conn

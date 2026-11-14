@@ -19,6 +19,7 @@ defmodule Marrylocal.Accounts.Verifications do
   alias Marrylocal.Workers.DuplicateAccountPurgeWorker
 
   @pending_status "pending_admin_review"
+  @active_identity_statuses ~w(pending_bot_ocr pending_admin_review verified)
 
   @doc """
   Creates or replaces the user's verification submission.
@@ -34,8 +35,8 @@ defmodule Marrylocal.Accounts.Verifications do
 
     case submission_gate(user, identity_hash) do
       :ok ->
-        existing = Repo.get_by(IdentityVerification, user_id: user.id)
-        verification = existing || %IdentityVerification{user_id: user.id}
+        verification = %IdentityVerification{user_id: user.id}
+        submitted_at = DateTime.utc_now() |> DateTime.truncate(:second)
 
         # This line performs the R2 upload via Waffle.Ecto. Keep it outside the
         # transaction so the database is never held during network I/O.
@@ -44,13 +45,14 @@ defmodule Marrylocal.Accounts.Verifications do
             verification,
             Map.merge(attrs, %{
               "identity_hash" => identity_hash,
-              "status" => @pending_status
+              "status" => @pending_status,
+              "submitted_at" => submitted_at
             })
           )
 
         result =
           Repo.transaction(fn ->
-            case Repo.insert_or_update(changeset) do
+            case Repo.insert(changeset) do
               {:ok, saved} ->
                 case VerificationProcessor.process_submission(saved) do
                   {:ok, processed} -> processed
@@ -86,13 +88,28 @@ defmodule Marrylocal.Accounts.Verifications do
   end
 
   defp submission_gate(user, identity_hash) do
-    existing = Repo.get_by(IdentityVerification, user_id: user.id)
-    claimed = Repo.get_by(IdentityVerification, identity_hash: identity_hash)
+    latest = latest_verification(user.id)
+
+    claimed? =
+      Repo.exists?(
+        from v in IdentityVerification,
+          where:
+            v.identity_hash == ^identity_hash and v.user_id != ^user.id and
+              v.status in ^@active_identity_statuses
+      )
 
     cond do
-      existing && existing.status == "verified" -> {:error, :already_verified}
-      claimed && claimed.user_id != user.id -> {:error, :duplicate_identity}
-      true -> :ok
+      latest && latest.status == "verified" ->
+        {:error, :already_verified}
+
+      latest && latest.status in ["pending_bot_ocr", "pending_admin_review"] ->
+        {:error, :already_pending}
+
+      claimed? ->
+        {:error, :duplicate_identity}
+
+      true ->
+        :ok
     end
   end
 
@@ -161,7 +178,9 @@ defmodule Marrylocal.Accounts.Verifications do
 
   def duplicate_identity_warning?(%IdentityVerification{} = verification) do
     from(v in IdentityVerification,
-      where: v.identity_hash == ^verification.identity_hash and v.id != ^verification.id,
+      where:
+        v.identity_hash == ^verification.identity_hash and v.id != ^verification.id and
+          v.user_id != ^verification.user_id,
       select: count(v.id)
     )
     |> Repo.one()
@@ -190,29 +209,55 @@ defmodule Marrylocal.Accounts.Verifications do
     end
   end
 
-  @doc "Fetches the current user's verification submission, if any."
+  @doc "Fetches the current user's latest verification submission, if any."
   def get_for_user(user_id) do
-    IdentityVerification
-    |> Repo.get_by(user_id: user_id)
-    |> case do
+    case latest_verification(user_id) do
       nil -> nil
       verification -> Repo.preload(verification, :user)
     end
+  end
+
+  @doc "Returns every verification submission for a user, newest first."
+  def history_for_user(user_id) do
+    IdentityVerification
+    |> where([v], v.user_id == ^user_id)
+    |> order_by([v], desc: coalesce(v.submitted_at, v.inserted_at), desc: v.id)
+    |> preload([:user])
+    |> Repo.all()
+  end
+
+  defp latest_verification(user_id) do
+    IdentityVerification
+    |> where([v], v.user_id == ^user_id)
+    |> order_by([v], desc: coalesce(v.submitted_at, v.inserted_at), desc: v.id)
+    |> limit(1)
+    |> Repo.one()
   end
 
   @doc """
   Approves one verification, flips the matching user trust flag, writes and
   broadcasts a success notification, then purges the raw R2 document.
   """
-  def approve(%IdentityVerification{user: %User{} = user} = verification) do
+  def approve(verification, admin_id \\ nil)
+
+  def approve(%IdentityVerification{user: %User{} = user} = verification, admin_id) do
+    reviewed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    changes = %{status: "verified", rejection_reason: nil, reviewed_at: reviewed_at}
+
+    changes =
+      if is_integer(admin_id),
+        do: Map.put(changes, :reviewed_by_admin_id, admin_id),
+        else: changes
+
     result =
       Repo.transaction(fn ->
         with {:ok, updated} <-
                verification
-               |> Ecto.Changeset.change(status: "verified", rejection_reason: nil)
+               |> Ecto.Changeset.change(changes)
                |> Repo.update(),
              {:ok, _user} <- mark_user_verified(user, updated.document_type),
-             {:ok, notification} <- create_verified_notification(updated.user_id) do
+             {:ok, notification} <- create_verification_notification(updated, :approved) do
           {updated, notification}
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -241,15 +286,27 @@ defmodule Marrylocal.Accounts.Verifications do
   Rejects one verification with a reason, notifies the owner over the socket,
   and removes the raw document object from R2.
   """
-  def reject(%IdentityVerification{user: %User{} = _user} = verification, reason)
+  def reject(verification, reason, admin_id \\ nil)
+
+  def reject(%IdentityVerification{user: %User{} = _user} = verification, reason, admin_id)
       when is_binary(reason) do
+    reviewed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    changes = %{status: "rejected", rejection_reason: reason, reviewed_at: reviewed_at}
+
+    changes =
+      if is_integer(admin_id),
+        do: Map.put(changes, :reviewed_by_admin_id, admin_id),
+        else: changes
+
     result =
       Repo.transaction(fn ->
         with {:ok, updated} <-
                verification
-               |> Ecto.Changeset.change(status: "rejected", rejection_reason: reason)
+               |> Ecto.Changeset.change(changes)
                |> Repo.update(),
-             {:ok, notification} <- create_rejected_notification(updated.user_id, reason) do
+             {:ok, notification} <-
+               create_verification_notification(updated, {:rejected, reason}) do
           {updated, notification}
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -267,7 +324,7 @@ defmodule Marrylocal.Accounts.Verifications do
     end
   end
 
-  def reject(_verification, _reason), do: {:error, :rejection_reason_required}
+  def reject(_verification, _reason, _admin_id), do: {:error, :rejection_reason_required}
 
   defp mark_user_verified(%User{} = user, document_type) do
     case verification_flag(document_type) do
@@ -305,21 +362,32 @@ defmodule Marrylocal.Accounts.Verifications do
   defp verification_flag("license"), do: :license_verified
   defp verification_flag(_type), do: nil
 
-  defp create_verified_notification(user_id) do
-    Notifications.insert_notification(%{
-      user_id: user_id,
-      type: :system,
-      title: "Identity verified",
-      body: "Your identity document has been verified. Your profile now carries a trust badge."
-    })
-  end
+  defp create_verification_notification(verification, decision) do
+    document = verification.document_type |> to_string() |> String.capitalize()
+    date = Calendar.strftime(DateTime.utc_now(), "%d %B %Y")
 
-  defp create_rejected_notification(user_id, reason) do
+    {title, body} =
+      case decision do
+        :approved ->
+          {"Identity Verification Approved",
+           "Your #{document} verification has been approved on #{date}. Your ID Verified badge is now active!"}
+
+        {:rejected, reason} ->
+          {"Identity Verification Update",
+           "Your #{document} submission could not be verified. Reason: #{reason}. Please review and submit a clearer document."}
+      end
+
     Notifications.insert_notification(%{
-      user_id: user_id,
-      type: :system,
-      title: "Identity verification needs attention",
-      body: reason
+      user_id: verification.user_id,
+      type: :verification_update,
+      title: title,
+      body: body,
+      is_read: false,
+      metadata: %{
+        "verification_id" => verification.id,
+        "decision" => if(decision == :approved, do: "approved", else: "rejected"),
+        "document_type" => verification.document_type
+      }
     })
   end
 

@@ -54,6 +54,7 @@ defmodule Marrylocal.Admin.Audit do
   end
 
   defp stringify(values) when is_list(values), do: Enum.map(values, &stringify/1)
+  defp stringify(value) when is_boolean(value), do: value
   defp stringify(nil), do: nil
   defp stringify(value) when is_atom(value), do: Atom.to_string(value)
   defp stringify(value), do: value

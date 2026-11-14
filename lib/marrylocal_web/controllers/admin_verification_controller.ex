@@ -36,8 +36,10 @@ defmodule MarrylocalWeb.AdminVerificationController do
   end
 
   def approve(conn, %{"id" => id}) do
+    admin_id = conn.assigns.current_user.id
+
     with %{} = verification <- Verifications.get(id),
-         {:ok, updated} <- Verifications.approve(verification) do
+         {:ok, updated} <- Verifications.approve(verification, admin_id) do
       Audit.record(conn, "admin.verification.approve", updated.id, %{
         user_id: updated.user_id,
         document_type: updated.document_type
@@ -58,10 +60,11 @@ defmodule MarrylocalWeb.AdminVerificationController do
 
   def reject(conn, %{"id" => id} = params) do
     reason = params["reason"] || params["rejection_reason"]
+    admin_id = conn.assigns.current_user.id
 
     with {:ok, reason} <- normalize_reason(reason),
          %{} = verification <- Verifications.get(id),
-         {:ok, updated} <- Verifications.reject(verification, reason) do
+         {:ok, updated} <- Verifications.reject(verification, reason, admin_id) do
       Audit.record(conn, "admin.verification.reject", updated.id, %{
         user_id: updated.user_id,
         document_type: updated.document_type,

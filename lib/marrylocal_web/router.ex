@@ -91,6 +91,7 @@ defmodule MarrylocalWeb.Router do
 
     get "/users", UserController, :index
     get "/users/lookup", UserController, :lookup
+    get "/users/:id/verifications", UserController, :verification_history
     post "/users/grant-peer-verifier", UserController, :grant_peer_verifier
     patch "/users/:id", UserController, :update
     post "/users/bulk-update", UserController, :bulk_update
@@ -101,6 +102,9 @@ defmodule MarrylocalWeb.Router do
     patch "/settings", SettingsController, :update
     patch "/settings/gating", SettingsController, :update
     get "/invoices", InvoiceController, :index
+    get "/reports", ReportController, :index
+    get "/reports/:id", ReportController, :show
+    patch "/reports/:id", ReportController, :update
     post "/emails/bulk-send", EmailController, :bulk_send
     get "/emails/preview-count", EmailController, :preview_count
     post "/notifications/broadcast", NotificationController, :broadcast
@@ -195,6 +199,10 @@ defmodule MarrylocalWeb.Router do
 
     # Identity verification lifecycle
     get "/v1/verifications/me", VerificationController, :show
+    get "/v1/verifications/history", VerificationController, :history
+
+    # Member safety reports
+    post "/v1/reports", ReportController, :create
 
     # Peer-to-peer vouch verification
     post "/v1/vouch/generate-token", VouchController, :request_token
